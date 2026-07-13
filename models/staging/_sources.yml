@@ -1,0 +1,37 @@
+version: 2
+
+sources:
+  - name: raw_data
+    database: RAW_DATA
+    schema: dbt_youngli  # adjust if your raw tables live in a different schema than your dbt models
+    tables:
+      - name: restaurants
+        description: "Dimension. One row per restaurant location. Grain: restaurant_id."
+        columns:
+          - name: restaurant_id
+            tests: [unique, not_null]
+
+      - name: menu_items
+        description: "Dimension. The menu, with base_price. Grain: menu_item_id."
+        columns:
+          - name: menu_item_id
+            tests: [unique, not_null]
+
+      - name: customers
+        description: "Dimension. Loyalty customers only (guests aren't rows here). Grain: customer_id."
+        columns:
+          - name: customer_id
+            tests: [unique, not_null]
+
+      - name: orders
+        description: "Fact, header only, no total. Grain: order_id — NOTE: source has ~0.4% wholesale-duplicated order_ids by design, so don't test unique here, only downstream after dedup."
+        columns:
+          - name: order_id
+            tests: [not_null]
+
+      - name: order_items
+        description: "Fact, one row per line item. unit_price is snapshotted at order time. Grain: order_item_id."
+        columns:
+          - name: order_item_id
+            tests: [unique, not_null]
+

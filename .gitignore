@@ -8,3 +8,4 @@ venv/
 profiles.yml
 *.p8
 *.pem
+raw_data/

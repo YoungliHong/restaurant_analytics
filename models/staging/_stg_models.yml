@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: stg_restaurants
+    columns:
+      - name: restaurant_id
+        tests: 
+          - unique
+          - not_null
+
+  - name: stg_menu_items
+    columns:
+      - name: menu_item_id
+        tests: 
+          - unique
+          - not_null
+
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        tests: 
+          - unique
+          - not_null
+
+  - name: stg_orders
+    columns:
+      - name: order_id
+        tests: 
+          - not_null   # NOT unique — dupes are still present pre-dedup (Phase 3.1)
+      - name: order_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['dine_in', 'takeout', 'delivery'] 
+      - name: payment_method
+        tests: 
+          - accepted_values:
+              arguments:             
+                values: ['card', 'cash', 'mobile_pay', 'gift_card']
+
+  - name: stg_order_items
+    columns:
+      - name: order_item_id
+        tests: 
+          - unique 
+          - not_null 

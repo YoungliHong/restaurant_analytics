@@ -1,0 +1,40 @@
+# models/marts/_marts.yml
+version: 2
+
+models:
+  - name: fct_orders
+    columns: 
+      - name: order_id
+        tests: [unique, not_null]
+      - name: restaurant_id
+        tests: 
+          - relationships:
+              arguments:
+                to: ref('dim_restaurants')
+                field: restaurant_id
+
+  - name: dim_restaurants
+    columns: 
+      - name: restaurant_id
+        tests: [unique, not_null]
+
+  - name: dim_menu_items
+    columns: 
+      - name: menu_item_id
+        tests: [unique, not_null]
+
+  - name: dim_customers
+    columns: 
+      - name: customer_id
+        tests: [unique, not_null]
+      
+  - name: int_order_items_priced
+    columns: 
+      - name: order_item_id
+        tests: [unique, not_null]
+      - name: order_id
+        tests: 
+          - relationships:
+              arguments:
+                to: ref('int_orders_deduped')
+                field: order_id

@@ -3,7 +3,7 @@ version: 2
 sources:
   - name: raw_data
     database: RAW_DATA
-    schema: dbt_youngli  # adjust if your raw tables live in a different schema than your dbt models
+    schema: RESTAURANT  # adjust if your raw tables live in a different schema than your dbt models
     tables:
       - name: restaurants
         description: "Dimension. One row per restaurant location. Grain: restaurant_id."

@@ -57,3 +57,18 @@ models:
               - restaurant_id
               - category
               - month
+
+  - name: fct_item_demand_by_hour
+    columns: 
+      - name: menu_item_id
+        tests: 
+          - not_null
+      - name: hour_of_day
+        tests:
+          - not_null
+    tests: 
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - menu_item_id
+              - hour_of_day

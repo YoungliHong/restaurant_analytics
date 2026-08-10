@@ -12,7 +12,7 @@ renamed as (
         customer_id,
         first_name,
         last_name,
-        email,
+        nullif(trim(email), '') as email,
         nullif(trim(phone), '') as phone,
         signup_date::date       as signup_date,
         loyalty_tier

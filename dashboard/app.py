@@ -6,10 +6,11 @@ st.title("Restaurant Analytics Dashboard")
 
 conn = st.connection("snowflake")
 
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3,tab4 = st.tabs([
     "Revenue by Restaurant / Category / Month",
     "Item Demand by Hour",
     "Price Pass-Through",
+    "Price Sensitivity by Tier"
 ])
 
 # ---------------------------------------------------------------------------
@@ -194,3 +195,44 @@ with tab3:
     )
 
     st.dataframe(pass_through_df)
+
+# ---------------------------------------------------------------------------
+# Tab 4 — Price Sensitivity by Tier
+# ---------------------------------------------------------------------------
+with tab4:
+    st.subheader("Price Increase Sensitivity by Loyalty Tier")
+
+    @st.cache_data
+    def load_tier_sensitivity():
+        query = """
+            select
+                loyalty_tier,
+                pre_units,
+                post_units,
+                units_ratio,
+                pre_revenue,
+                post_revenue,
+                revenue_ratio
+            from fct_price_ratio_by_tier
+            order by loyalty_tier
+        """
+        return conn.query(query)
+
+    tier_df = load_tier_sensitivity()
+
+    chart_data = tier_df.set_index("LOYALTY_TIER")[["UNITS_RATIO", "REVENUE_RATIO"]]
+
+    st.bar_chart(chart_data)
+
+    m1, m2, m3, m4 = st.columns(4)
+    for col, (_, row) in zip([m1, m2, m3, m4], tier_df.iterrows()):
+        col.metric(row["LOYALTY_TIER"].capitalize(), f"{row['UNITS_RATIO']:.3f} units")
+
+    st.caption(
+        "Ratios cluster near ~1.08 - 1.13, consistent with Tab 3's item-level price ratio, "
+        "with silver a mild outlier at ~0.88-0.94. The generator doesn't encode "
+        "differential price elasticity by tier, so this divergence is most likely "
+        "small-sample noise rather than a real behavioral difference — a caveat, not a finding."
+    )
+
+    st.dataframe(tier_df)

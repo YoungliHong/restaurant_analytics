@@ -27,7 +27,7 @@ Snowflake Databases Structure:
                 iii. ORDERS
                 iv. ORDER_ITEMS
                 v. RESTAURANTS
-``` mermaid
+```mermaid
 flowchart LR
     A["generate_restaurant_data.py<br/>(5 CSVs)"] --> B[("Snowflake RAW_DATA<br/>stage + COPY INTO")]
     B --> C["staging models<br/>(stg_*)"]
@@ -41,7 +41,7 @@ flowchart LR
     style B fill:#fff4e1,color:#000
     style H fill:#f0e1ff,color:#000
     style G fill:#e1ffe1,color:#000
-​```
+```
 
 ## Database design
 Two separate databases for two separate purposes: raw_analytics houses the raw data, dbt_youngli contains all the derived tables. raw_analytics requires tighter access and can't be recovered easily if data gets lost while the dbt_youngli tables can be recomputed. The dbt layers for staging, intermediates, and marts share the same lifecycle: rebuildable from raw on demand and all owned by the same transformation logic.
@@ -125,7 +125,8 @@ This project's volume (5K orders) never needed Spark — Snowflake/dbt handled e
  ### Transaction time pricing
   We could've used menu_items.base_price when calculating revenue but consider the price spike we observed in July of 8%. If base_price was snapshot post July, when we retroactively apply that price to all orders before July, the revenue would be inflated. Similarly, if the snapshot price was before July, we would silently undershoooting the revenue. This is why having and using the transaction time pricing was crucial to the revenue analysis. Another applicable scenario would be any discounted items in the order since the price difference wouldn't be reflected in the base_price.
 
-  ### Cleaning/deduping: Deduping runs before joining to line-item order, post join the revenue would be double counted for every duplicate row. We choose one of the duplicates to keep, since they're byte identical the one we pick isn't important -> ROW_NUMBER() PARTITION BY order_id ORDER BY order_timestamp
+  ### Cleaning/deduping
+  Deduping runs before joining to line-item order, post join the revenue would be double counted for every duplicate row. We choose one of the duplicates to keep, since they're byte identical the one we pick isn't important -> ROW_NUMBER() PARTITION BY order_id ORDER BY order_timestamp
  
   Note: Ordering by the timestamp here doesn't matter nor does it guaranteed take the first entry since they're byte identical, we use it to just deterministically pick one.
 

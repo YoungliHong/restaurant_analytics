@@ -27,9 +27,6 @@ Snowflake Databases Structure:
                 iii. ORDERS
                 iv. ORDER_ITEMS
                 v. RESTAURANTS
-
-
-
 ```mermaid
 flowchart LR
     A["generate_restaurant_data.py<br/>(5 CSVs)"] --> B[("Snowflake RAW_DATA<br/>stage + COPY INTO")]
@@ -45,8 +42,6 @@ flowchart LR
     style H fill:#f0e1ff,color:#000
     style G fill:#e1ffe1,color:#000
 ​```
-
-
 ## Database design
 Two separate databases for two separate purposes: raw_analytics houses the raw data, dbt_youngli contains all the derived tables. raw_analytics requires tighter access and can't be recovered easily if data gets lost while the dbt_youngli tables can be recomputed. The dbt layers for staging, intermediates, and marts share the same lifecycle: rebuildable from raw on demand and all owned by the same transformation logic.
 

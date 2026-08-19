@@ -40,10 +40,10 @@ flowchart LR
     F --> G["Streamlit Dashboard"]
     D -.->|ported to PySpark| H["Databricks Free Edition<br/>(int_order_items_priced)"]
 
-    style A fill:\#e1f5ff, color:\#000
-    style B fill:\#fff4e1, color:\#000
-    style H fill:\#f0e1ff, color:\#000
-    style G fill:\#e1ffe1, color:\#000
+    style A fill:#e1f5ff,color:#000
+    style B fill:#fff4e1,color:#000
+    style H fill:#f0e1ff,color:#000
+    style G fill:#e1ffe1,color:#000
 ​```
 
 

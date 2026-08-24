@@ -135,8 +135,8 @@ with tab3:
                     end as period,
                     oi.quantity as quantity,
                     oi.unit_price
-                from int_order_items_priced oi
-                inner join int_orders_deduped o
+                from vw_int_order_items_priced oi
+                inner join vw_int_orders_deduped o
                     on oi.order_id = o.order_id
                 inner join dim_menu_items mi
                     on oi.menu_item_id = mi.menu_item_id

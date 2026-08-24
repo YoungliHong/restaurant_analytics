@@ -4,29 +4,27 @@
 This was created to model the fluctuations in restaurant revenue in relation to price increases of certain menu items. I chose restaurant orders since I plan to import real POS Clover data from my parents' restaurant. The stack is: Python generator -> Snowflake (raw_data + analytics) -> dbt_core(dbt_youngli) -> PySpark/Databricks -> Git. The source data consists of 4 restaurants, 5000 orders, and 13000 line items. I intentionally injected some messiness and included the snapshot price so that I could address the transaction-time problem.
 
 Snowflake Databases Structure: 
-    1. ANALYTICS (db)
-        a. DBT_YOUNGLI (schema)
-            Tables
-                i. DIM_CUSTOMERS
-                ii. DIM_MENU_ITEMS
-                iii. DIM_RESTAURANTS
-                iv. FCT_ITEM_DEMAND_BY_HOUR
-                v. FCT_ORDERS
-                vi. FCT_REVENUE_BY_RESTAURANT_CATEGORY_MONTH
-            Views
-                i. INT_ORDERS_DEDUPED
-                ii. STG_CUSTOMERS
-                iii. STG_MENU_ITEMS
-                iv. STG_ORDERS
-                v. STG_RESTAURANTS
-    2. RAW_DATA (db)
-        b. RESTAURANT (schema)
-            Tables
-                i. CUSTOMERS
-                ii. MENU_ITEMS
-                iii. ORDERS
-                iv. ORDER_ITEMS
-                v. RESTAURANTS
+1. RAW_DATA (db)
+    - RESTAURANT (schema)
+        - CUSTOMERS 
+        - MENU_ITEMS
+        - ORDERS
+        - ORDER_ITEMS
+        - RESTAURANTS
+2. ANALYTICS (db)
+    - STAGING (schema)
+    - DBT_YOUNGLI (schema)
+        - DIM_CUSTOMERS
+        - DIM_MENU_ITEMS
+        - DIM_RESTAURANTS
+        - FCT_ITEM_DEMAND_BY_HOUR
+        - FCT_ORDERS
+        - FCT_REVENUE_BY_RESTAURANT_CATEGORY_MONTH
+        - INT_ORDERS_DEDUPED
+        - STG_CUSTOMERS
+        - STG_MENU_ITEMS
+        - STG_ORDERS
+        - STG_RESTAURANTS
 ```mermaid
 flowchart LR
     A["generate_restaurant_data.py<br/>(5 CSVs)"] --> B[("Snowflake RAW_DATA<br/>stage + COPY INTO")]
@@ -48,9 +46,9 @@ Two separate databases for two separate purposes: raw_analytics houses the raw d
 
 
 ## Data flow narrative
-1. Generated initial dataset with generate_restaurant_data.py which contains 3 dims - restaurants, menu_items, and customers and 2 facts - orders (order grain) and order_items (line-item grain).
+1. Run generate_restaurant_data.py to locally generate the five tables: CUSTOMERS, MENU_ITEMS, ORDERS, ORDER_ITEMS, RESTAURANTS
 
-2. The generated csvs land in Snowflake via stage + COPY INTO. 
+2. Import data into Snowflake via STAGE ->  COPY INTO the raw data db (raw_data). No cleaning here, data in raw_data should stay untouched in case we need to back up the data in the analytics db.
 
 3. Define sources in _sources.yml, and then build the staging models with light cleanup only (stg_customers, stg_menu_items, stg_order_items, stg_orders, stg_restaurants).
 
@@ -61,24 +59,29 @@ Two separate databases for two separate purposes: raw_analytics houses the raw d
     b. int_order_items_priced captures the transaction-time price of the ordered item. Since menu_items.base_price doesn't account for the price fluctuations of the order item, we need to use order_items.unit_price which is the snapshot price. 
 
 6. Marts 
-    a. fct_orders: From int_order_items_priced, aggregate line items per order to generate order grain
-    b. dim_customers: columns describing customer specific details like name, email, and phone number. We create a new flag here "is_signup_after_first_order" to signal when a customer has a first order timestamp before their signup date.
-    dim_restaurants and dim_menu_items are pulled from staging tables without extra computations.
+    1. fct_orders: From int_order_items_priced, aggregate line items per order to generate order grain
+    2. dim_customers: columns describing customer specific details like name, email, and phone number. We create a new flag here "is_signup_after_first_order" to signal when a customer has a first order timestamp before their signup date.
+    3. dim_restaurants and dim_menu_items are pulled from staging tables without extra computations.
 
-7. Revenue Marts
-    Distribution of orders by status is 94% "completed", 4% "cancelled", and 2% "refunded". 
-
-    a. fct_revenue_by_restaurant_category_month: We know gross revenue = sum(all transactions) and net revenue = gross - refunds - discounts/comps -> in our case this is just net = gross - refunds. Once we perform an inner join on int_order_items_priced and int_orders_deduped and dim_menu_items we have line-item grain which we can aggregate once to derive the gross revenue/total refunded order amounts on a  restaurant, category, month grain. Following from the earlier formula, net revenue is just the difference between those two.
+## Revenue Marts
+Distribution of orders by status is 94% "completed", 4% "cancelled", and 2% "refunded". 
     
-    To test the claim, added tests/gross_equals_net_plus_refunded.sql that selects all rows in fct_revenue_by_restaurant_category_month where the net revenue isn't equal to the refunded amount + gross revenue.
 
-    b. fct_item_demand_by_hour: this is the same inner join but we're instead looking at menu items and the amount they sold per order in relation to the hour of the timestamp.
+#### **fct_revenue_by_restaurant_category_month**
+We know gross revenue = sum(all transactions) and net revenue = gross - refunds - discounts/comps -> in our case this is just net = gross - refunds. Once we perform an inner join on int_order_items_priced and int_orders_deduped and dim_menu_items we have line-item grain which we can aggregate once to derive the gross revenue/total refunded order amounts on a  restaurant, category, month grain. Following from the earlier formula, net revenue is just the difference between those two.
+  
+#### ``fct_item_demand_by_hour``
+This is the same inner join but we're instead looking at menu items and the amount they sold per order in relation to the hour of the timestamp.
 
-    c. fct_price_ratio_by_tier: extends fct_item_demand_by_hour pre/post price bump split and applying it to the loyalty tier grain. Joins int_order_items_priced, int_orders_deduped, and dim_customers, aggregates units/revenue by tier and period, then derives the unit_ratio and revenue_ratio per tier.
-8. StreamLit Dashboard
+
+
+#### ``fct_price_ratio_by_tier``
+Extends fct_item_demand_by_hour pre/post price bump split and applies it to the loyalty tier grain. Then joins int_order_items_priced, int_orders_deduped, and dim_customers, aggregates units/revenue by tier and period, then derives each tier's unit_ratio and revenue_ratio.
+
+## StreamLit Dashboard
 Visualize the tables from the previous part - dish demand by hour and revenue marts
 
-Command to run in venv: streamlit run dashboard/app.py
+Command prompt (in venv): ``` streamlit run dashboard/app.py ```
 
 Tab 1: Revenue by Restaurant / Category / Month
 This is created by fct_revenue_by_restaurant_category_month with a join with dim_restaurants to get the restaurant names. 

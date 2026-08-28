@@ -1,0 +1,14 @@
+restaurant_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: ACCOUNT_NAME
+      user: USERNAME
+      role: TRANSFORMER
+      warehouse: WAREHHOUSE_NAME
+      database: ANALYTICS
+      schema: STAGING
+      # Key-pair (JWT) authentication — see README Setup section for key generation steps
+      private_key_path: /Users/sampleuser/.ssh/snowflake_key_new.p8
+      threads: 4

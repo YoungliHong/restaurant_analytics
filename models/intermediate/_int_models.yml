@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: int_orders_deduped
+    description: >
+      Orders deduplicated via ROW_NUMBER() PARTITION BY order_id, keeping
+      one row per order_id. The generator injects ~0.4% duplicate orders
+      by design; this model is where that contract is restored.
+    columns:
+      - name: order_id
+        description: Unique identifier for each order, post-dedup.
+        tests:
+          - unique
+          - not_null
+
+  - name: int_order_items_priced
+    description: >
+      Order line items joined to deduplicated orders. unit_price is the
+      value snapshotted at transaction time, not menu_items.base_price —
+      do not join back to base_price for revenue calculations.
+    columns:
+      - name: order_item_id
+        description: Unique identifier for each order line item.
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        description: Foreign key to int_orders_deduped.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('int_orders_deduped')
+                field: order_id

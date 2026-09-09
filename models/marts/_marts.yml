@@ -27,18 +27,6 @@ models:
     columns: 
       - name: customer_id
         tests: [unique, not_null]
-      
-  - name: int_order_items_priced
-    columns: 
-      - name: order_item_id
-        tests: [unique, not_null]
-      - name: order_id
-        tests: 
-          - relationships:
-              arguments:
-                to: ref('int_orders_deduped')
-                field: order_id
-
   - name: fct_revenue_by_restaurant_category_month
     columns:
       - name: restaurant_id

@@ -31,8 +31,8 @@ with tab1:
                 rev.refunded_amount,
                 rev.units_sold,
                 rev.order_count
-            from fct_revenue_by_restaurant_category_month rev
-            inner join dim_restaurants r
+            from MARTS.fct_revenue_by_restaurant_category_month rev
+            inner join MARTS.dim_restaurants r
                 on rev.restaurant_id = r.restaurant_id
             order by rev.month
         """
@@ -64,7 +64,6 @@ with tab1:
     total_gross = filtered["GROSS_REVENUE"].sum()
     total_net = filtered["NET_REVENUE"].sum()
     total_refunded = filtered["REFUNDED_AMOUNT"].sum()
-
     m1, m2, m3 = st.columns(3)
     m1.metric("Gross Revenue", f"${total_gross:,.2f}")
     m2.metric("Net Revenue", f"${total_net:,.2f}")
@@ -88,7 +87,7 @@ with tab2:
                 hour_of_day,
                 units_sold,
                 order_count
-            from fct_item_demand_by_hour
+            from MARTS.fct_item_demand_by_hour
             order by hour_of_day
         """
         return conn.query(query)
@@ -135,10 +134,10 @@ with tab3:
                     end as period,
                     oi.quantity as quantity,
                     oi.unit_price
-                from vw_int_order_items_priced oi
-                inner join vw_int_orders_deduped o
+                from INTERMEDIATE.vw_int_order_items_priced oi
+                inner join INTERMEDIATE.vw_int_orders_deduped o
                     on oi.order_id = o.order_id
-                inner join dim_menu_items mi
+                inner join MARTS.dim_menu_items mi
                     on oi.menu_item_id = mi.menu_item_id
                 where o.status != 'cancelled'
             ),
@@ -213,7 +212,7 @@ with tab4:
                 pre_revenue,
                 post_revenue,
                 revenue_ratio
-            from fct_price_ratio_by_tier
+            from MARTS.fct_price_ratio_by_tier
             order by loyalty_tier
         """
         return conn.query(query)

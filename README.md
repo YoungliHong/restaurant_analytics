@@ -44,10 +44,10 @@ restaurant_analytics/
 │   ├── intermediate/                 # dedup, transaction-time pricing, views
 │   └── marts/                        # fact/dim tables, dashboard-facing
 ├── macros/
-│   └── generate_alias_name.sql       # vw_ prefix for view-materialized models
+│   ├── generate_alias_name.sql       # vw_ prefix for view-materialized models
 │   └── generate_schema_name.sql      # maps models to staging/intermediate/marts schemas
 ├── analyses/                         # ad-hoc queries, not part of the DAG
-│   └── signup_after_first_order.sql
+│   └── signup_after_first_order_rate.sql
 ├── notebooks/
 │   └── int_order_items_priced.ipynb  # PySpark port, Databricks Free Edition
 ├── tests/                            # custom singular tests
@@ -68,9 +68,9 @@ restaurant_analytics/
 ### Prerequisites
 
 - Python 3.10+ 
-- A snowflake account with a warehouse, and a role with create/select privileges on two databases (`RAW_DATA`, `ANALYTICS`)
+- A Snowflake account with a warehouse, and a role with create/select privileges on two databases (`RAW_DATA`, `ANALYTICS`)
 - dbt Core (dbt-snowflake adapter)
-- Databricks account (Free edition works) - only needed for PySpark layer
+- Databricks account (Free Edition works) - only needed for PySpark layer
 
 ### Setup
 
@@ -90,33 +90,33 @@ restaurant_analytics/
 3. Generate a key pair for Snowflake authentication:
     ```bash
     openssl genrsa -out snowflake_key.p8 2048
-    openssl rsa -in snowfllake_key.p8 -pubout -out snowflake_key.pub
+    openssl rsa -in snowflake_key.p8 -pubout -out snowflake_key.pub
     ```
     Register the public key on your Snowflake user. 
     (`ALTER USER <user> SET RSA_PUBLIC_KEY = <'contents of .pub file'>;`)
 
-3. Configure your dbt Snowflake connection in `~/.dbt/profiles.yml` (see `sample.profiles.yml` for expected structure)
+4. Configure your dbt Snowflake connection in `~/.dbt/profiles.yml` (see `sample.profiles.yml` for expected structure)
 
-4. Generate synthetic source data:
+5. Generate synthetic source data:
     ```bash
     python generate_restaurant_data.py
     ```
 
-5. Load raw CSVs into Snowflake (stage + COPY INTO  - see `sql/load_raw.sql`)
+6. Load raw CSVs into Snowflake (stage + COPY INTO  - see `sql/load_raw.sql`)
 
-6. Run dbt:
+7. Run dbt:
     ```bash
     dbt run
     dbt test
     ```
 
-7. Configure Streamlit's Snowflake connection in `.streamlit/secrets.toml` (see `sample.secrets.toml`)
+8. Configure Streamlit's Snowflake connection in `.streamlit/secrets.toml` (see `sample.secrets.toml`)
 
 ## Data Model
 
 ### Raw Sources
 
- Five CSV's land in `RAW_DATA`, similar to what would be seen in a POS extract: two small reference tables (`restaurants` and `menu_items`), a growing customer dimension (`customers`), and two fact tables (`orders` and `order_items`).  The full grain, primary keys, and known source messiness is documented in `models/staging/_sources.md`. 
+ Five CSVs land in `RAW_DATA`, similar to what would be seen in a POS extract: two small reference tables (`restaurants` and `menu_items`), a growing customer dimension (`customers`), and two fact tables (`orders` and `order_items`).  The full grain, primary keys, and known source messiness is documented in `models/staging/_sources.md`. 
 
 ### Entity Relationship Diagram
 
@@ -140,7 +140,7 @@ erDiagram
     boolean is_signup_after_first_order
   }
   DIM_MENU_ITEMS {
-    number menu_item_
+    number menu_item_id PK
     text item_name
     text category
     number current_base_price
@@ -195,7 +195,7 @@ erDiagram
 ```
 ### Staging → Intermediate → Marts 
 
-**Staging** - one model per source, same grain as the source table (1:1, no joins or aggregation). Light cleanup only: casing/whitespace normalization, null coercion. Materialized as views. Only the intermediates will consume these views directly. 
+**Staging** - one model per source, same grain as the source table (1:1, no joins or aggregation). Light cleanup only: casing/whitespace normalization, null coercion. Materialized as views, staging feeds both intermediate (for fact-table logic requiring dedup/pricing) and marts directly (for dimension tables with no cardinality-changing transforms needed).
 
 **Intermediates** - logic that changes cardinality or is shared by multiple downstream models: order deduplication (many-to-one -> one-to-one per order_id), transaction-time price application.  Materialized as views (queried directly by marts and dashboard - see Design Decisions). 
 
@@ -221,7 +221,7 @@ graph LR
     subgraph Marts
         dim_customers
         dim_menu_items
-        dim_restaurnts
+        dim_restaurants
         fct_orders
         fct_item_demand_by_hour
         fct_price_ratio_by_tier
@@ -249,7 +249,7 @@ graph LR
     int_orders_deduped --> fct_price_ratio_by_tier
 
     dim_menu_items --> fct_revenue_by_restaurant_category_month
-    int_order_items_deduped --> fct_revenue_by_restaurant_category_month
+    int_order_items_priced --> fct_revenue_by_restaurant_category_month
     int_orders_deduped --> fct_revenue_by_restaurant_category_month
 ```
 *Note: Graph is rendered via Mermaid from `manifest.json`'s `parent_map`, since `dbt docs generate` isn't fully supported under the dbt Fusion engine (alpha) used here.*
@@ -262,7 +262,7 @@ The decision to use two databases was made by considering blast radius and contr
     
 ### Views vs. tables by layer (and why intermediate deviates from ephemeral)
 
-Intermediates use views rather than dbt's more common ephermeral default, because the dashboard queries both intermediate views for the price-pass through tab. Ephemeral models don't exist as queryable objects outside of dbt's own compile graph. They only exist as inlined CTEs within whatever references them.
+Intermediates use views rather than dbt's more common ephemeral default, because the dashboard queries both intermediate views for the price-pass through tab. Ephemeral models don't exist as queryable objects outside of dbt's own compile graph. They only exist as inlined CTEs within whatever references them.
 
 
 ### Transaction-time pricing (unit_price snapshot vs. base_price)
@@ -273,52 +273,28 @@ Revenue calculations use `order_items.unit_price` rather than joining to `menu_i
 
 Deduping runs before joining to line-item order, post join the revenue would be double counted for every duplicate row. We choose one of the duplicates to keep, since they're byte identical the one we pick isn't important -> ` ROW_NUMBER() PARTITION BY order_id ORDER BY order_timestamp`
  
-Note: Ordering by the timestamp here doesn't matter nor does it guaranteed take the first entry since they're byte identical, we use it to just deterministically pick one.
+Note: Ordering by the timestamp here doesn't matter nor does it guarantee it takes the first entry since they're byte identical, we use it to just deterministically pick one.
 
-Honest Caveats: This dedup logic assumes byte identical duplicates which won't always be the case in production scenario - e.g. retried submissions or sync conflicts. In those cases we would need to consider similar entries with slightly differing fields (duplicate landing across a price change boundary). It's not currently addresed in this implementation.
+Honest Caveats: This dedup logic assumes byte identical duplicates which won't always be the case in a production scenario - e.g. retried submissions or sync conflicts. In those cases we would need to consider similar entries with slightly differing fields (duplicate landing across a price change boundary). It's not currently addressed in this implementation.
 
 ### Signup-after-first-order handling
 
-The generator intentionally produces some customers with a signup_date after their first order — a plausible real-world pattern (a walk-in customer joining loyalty program after their first visit), not corrupted data. An early version of this check was a dbt test asserting `signup_date <= first_order_date` In practice, `analyses/signup_after_first_order_rate.sql` shows this holds for ~21% of customers (166/800) - too high a rate to be noise, and not actually invalid. A test expected to fail on one in five rows isn't a meaninful test, so the check was moved to an analysis reporting the rate directly, and a boolean flag (`signup_after_first_order`) was added to `dim_customers` so the pattern is queryable rather than either silently ignored or treated as a pipeline failure.
+The generator intentionally produces some customers with a signup_date after their first order — a plausible real-world pattern (a walk-in customer joining loyalty program after their first visit), not corrupted data. An early version of this check was a dbt test asserting `signup_date <= first_order_date`. In practice, `analyses/signup_after_first_order_rate.sql` shows this holds for ~21% of customers (166/800) - too high a rate to be noise, and not actually invalid. A test expected to fail on one in five rows isn't a meaningful test, so the check was moved to an analysis reporting the rate directly, and a boolean flag (`signup_after_first_order`) was added to `dim_customers` so the pattern is queryable rather than either silently ignored or treated as a pipeline failure.
 
 ### Naming convention: model name (layer) vs. alias (materialization)
 
-Model file names reflect DAG layer (`stg_`/`int_`/`fct_`/`dim_`), while a `generate_alias_name` macro overrides add a `vw_` prefix only to the physical Snowflake object for view-materialized models. Keeping the these separate means changing the model's materialization later doesn't require renaming the file or updating any `ref()` calls - file identity and physical object identity are deliberately decoupled.
+Model file names reflect DAG layer (`stg_`/`int_`/`fct_`/`dim_`), while a macro override adds a `vw_` prefix only to the physical Snowflake object for view-materialized models. Keeping the these separate means changing the model's materialization later doesn't require renaming the file or updating any `ref()` calls - file identity and physical object identity are deliberately decoupled.
 
 ## Dashboard
 
-### Setup
-
-1. **Open your teminal and navigate to the project directory.**
-
-2. **Create and activate a virtual environment.**
-
-    - **macOS / Linux / Git Bash:** 
-        ```bash
-        python -m venv venv
-        source venv/bin/activate
-        ```
-
-    - **Windows (Powershell):**
-        ```powershell
-        python -m venv venv
-        .\venv\Scripts\Activate.ps1
-        ```
-    
-    - **Windows (Command Prompt):**
-        ```cmd
-        python -m venv venv
-        venv\Scripts\activate.bat
-        ```
-
-3. **Run the Streamlit app:**
-   ```bash
-   streamlit run dashboard/app.py
-   ```
+**Launch the dashboard**:
+```bash
+streamlit run dashboard/app.py
+```
 
 
 ### Tab 1: Revenue by Restaurant / Category / Month 
-This is created by fct_revenue_by_restaurant_category_month with a join with dim_restaurants to get the restaurant names. 
+This is created by `fct_revenue_by_restaurant_category_month` with a join with `dim_restaurants` to get the restaurant names. 
 
 Two available filters: restaurant name and category 
 
@@ -326,7 +302,7 @@ Based on selection of previous filters, we group by/aggregate the revenue (gross
 
 ### Tab 2: Revenue by hour of day
 
-This is created from `fct_item_demand_by_hour` and reads units sold vs hour of day with a filter for category. The user should see two distinct spikes each day at round 12 pm (lunch) and 7 pm (dinner), a quick sanity check in the generate_restaurant_data.py script confirm this should be the case (see HOUR_WEIGHTS).
+This is created from `fct_item_demand_by_hour` and reads units sold vs hour of day with a filter for category. The user should see two distinct spikes each day at around 12 pm (lunch) and 7 pm (dinner), a quick sanity check in the generate_restaurant_data.py script confirms this should be the case (see HOUR_WEIGHTS).
 
 `HOUR_WEIGHTS = {11: 6, 12: 12, 13: 11, 14: 6, 15: 3, 16: 4,
                 17: 8, 18: 13, 19: 14, 20: 11, 21: 7, 22: 4}`
@@ -341,119 +317,48 @@ From this order item grain dataset, we can now aggregate each item's pre vs post
 
 From the result of the previous aggregation, we have each menu-item's pre and post price spike average realized prices so the last step is to coalesce back into item-grain. Price ratio is computed here as $\frac{pre.avg\_realized\_price}{post.avg\_realized\_price}$. Similarly the units ratio is $\frac{pre.units\_sold}{post.units\_sold}$.
 
-For this dataset, the price ratio agree with the price increase of around ~1.08 for all items. Answering our initial question of whether the increase would be observed in the revenue or mix shift.
+For this dataset, the price ratio agrees with the price increase of around ~1.08 for all items. Answering our initial question of whether the increase would be observed in the revenue or mix shift.
 
 
 
 ## Spark / Databricks Layer
 
-`int_orders_priced` was ported to PySpark and run on Databricks Free Edition (serverless) not out of a data driven necessity but to validate the transform in a distributed compute context and to get hands-on experience with distributed computing systems outside of Cosmos/SCOPE, Microsoft's internal big data framework. While the two share the same underlying distributed computing principles, Cosmos and SCOPE is optimized for ultra large batch workloads. The output matched the dbt/Snowflake version exactly ($180,604.30).
+`int_order_items_priced` was ported to PySpark and run on Databricks Free Edition (serverless), not out of a data-driven necessity, but to validate the transform in a distributed compute context and to get hands-on experience with distributed computing systems outside of Cosmos/SCOPE (Microsoft's internal big data framework). While the two share the same underlying distributed computing principles, Cosmos and SCOPE are optimized for ultra large batch workloads. The output matched the dbt/Snowflake version exactly ($180,604.30).
 
+Spark earns its keep when the data volume exceeds single-node or warehouse-scale efficiency (multi-TB, hundreds of millions+ rows), transformations that don't map cleanly to SQL (custom Python/Scala logic), or for streaming/real-time event processing pipelines. For this project, a single warehouse satisfies both memory and computation needs so it remains the correct option.
 
-We can assess if the Spark has a place in the pipeline by considering two different 
-- Data volume exceeds single-node or warehouse-scale efficiency (multi TB)
-- Complex non-SQL-expressable transformations
-
-Taking this project's workload into this context - the volume or orders to process are only in the thousands and transformations can be expressed as straightforward SQL queries. Thus there isn't a substantial performance benefit to using Spark in this project, but we can still understand the different approach.
 
 ## Testing
 
-- What's tested and where (staging vs. intermediate)
-- How to run `dbt test`
+Testing is done against the outputs at each stage of the pipeline: 
+
+**Staging**  - Staging model tests are defined in `models/staging/_stg_models.yml`. `not_null` on all primary keys, `accepted_values` on cleaned categorical columns (`order_type`, `payment_method`), `unique` on all primary keys except `stg_orders`. The uniqueness test is omitted for `stg_orders` because the data generator injects 0.4% of orders as duplicates, meaning the test would fail inevitably by design.
+
+**Intermediate** (`models/intermediate/_int_models.yml`) - `unique` + `not_null` on `order_id` in `int_orders_deduped`, asserting the dedup logic actually produced one row per order. `int_order_items_priced.order_id` is tested with `relationships` against `int_orders_deduped`, confirming every line item resolves to a real, deduplicated order.
+
+**Marts** (`models/marts/_marts.yml`) - `relationships` tests linking facts to their dimensions (e.g. `fct_revenue_by_restaurant_category_month.restaurant_id` -> `dim_restaurants.restaurant_id`), catching any join that would silently drop or orphan rows. 
+
+Run all tests:
+```bash
+dbt test
+```
+
+Run tests for a single model:
+```bash 
+dbt test --select stg_orders
+```
+
 
 ## Future Work
-- Phase 7 (real POS data) — noted as deliberately out of scope for now
+- **Phase 7 (real POS data)** - swapping in a real extract from family restaurant's POS system, mapped onto the existing staging layer. Deliberately scoped tight: one or two genuine insights, not a second project.
+
+- **Incremental materialization** - the current models fully refresh on every run, which is fine at this data volume. Would reach for `incremental` materializations at a scale where reprocessing full history becomes the actual bottleneck.
+
+- **Real-time/streaming-ingestion** - the current pipeline is batch, matching how POS data is actually available (periodic exports, not a live event feed). Streaming would only be warranted if a future requirement needed sub-minute latency on live order data. 
 
 
 
 
 
 
-
-
-
-
-
-- `stg_customers`: Phone number and email can be missing or have trailing/leading whitespace -> `nullif(trim(phone), '')` or `nullif(trim(email), '')`. 
-
-    - Note: While phone and email aren't used in the revenue marts, its inclusion in the staging model means we should proactively normalize these fields.
-
-- `stg_menu_items` & `stg_order_items`: `unit_price` and `base_price` are examples of numerical columns that we would want normalized `column_name::numeric(10,2)` in the revenue mart.
-
--  `stg_orders`: The `lower(trim(order_type))` and `lower(trim(payment_method))` normalizes order_type and payment_type by assigning all lower case and removing trailing or leading whitespace te
-    - `payment_method` canonical values are "card" / "cash" / mobile_pay / gift_card but we see values like 'giftcard' and 'mobile pay' so we use a conditional expression match such cases and normalize.
-
-- `stg_restaurants`: Cast opened_date as a date type. 
-
-
-
-## Data Flow 
-1. Run `generate_restaurant_data.py` to generate the five tables: `CUSTOMERS`, `MENU_ITEMS`, `ORDERS`, `ORDER_ITEMS`, `RESTAURANTS` locally. 
-
-2. `STAGE + COPY INTO` the raw source tables into Snowflake `RAW_DATA` db.
-
-3. Based on source contract, the five staging models are built per source. See above section on Messiness Handling.
-
-
-4. Intermediate models are created views from the staging models:
-    - `vw_int_orders_deduped` 
-    removes duplicates from stg_orders using windowing and row number i.e. `ROW_NUMBER() PARTITION BY order_id ORDER BY timestamp`. Byte identical duplicates implies the actual entry we choose to keep doesn't matter as long as we dedupe the others.
-
-    - ` vw_int_order_items_priced ` captures the transaction-time price of the ordered item. This is line-item grain. Since menu_items.base_price doesn't account for the price fluctuations of the order item, we need to use order_items.unit_price which is the snapshot price. 
-
-5. Marts are constructed from the intermediate models with the goal of being able to use the revenue marts directly in the analysis dashboard. 
-
-    - `fct_orders` serves as the primary revenue mart, it provides an accurate order grain revenue for each restaurant to model. This is only possible by using the transaction time line-item dataset that we join and aggregate to order grain.
-
-    - `dim_customers`: One additional flag, `is_signup_after_first_order`, created based on `first_order_timestamp < signup_date`. That is, we take each customer's first order and set the flag based on their signup status from that timestamp.
-
-    - `dim_restaurants` and `dim_menu_items` are pulled from staging tables without extra computations.
-
-## Revenue Marts
-
-`fct_revenue_by_restaurant_category_month:`
-We know gross revenue = sum(all transactions) and net revenue = gross - refunds - discounts/comps -> in our case this is just net = gross - refunds. Once we perform an inner join on int_order_items_priced and int_orders_deduped and dim_menu_items we have line-item grain which we can aggregate once to derive the gross revenue/total refunded order amounts on a  restaurant, category, month grain. Following from the earlier formula, net revenue is just the difference between those two.
-  
-`fct_item_demand_by_hour:`
-This is the same inner join but we're instead looking at menu items and the amount they sold per order in relation to the hour of the timestamp.
-
-
-
-`fct_price_ratio_by_tier:`
-Extends `fct_item_demand_by_hour` pre/post price bump split and applies it to the loyalty tier grain. Then joins int_order_items_priced, int_orders_deduped, and dim_customers, aggregates units/revenue by tier and period, then derives each tier's unit_ratio and revenue_ratio
-
-
-*OPTIONAL*  
-Ported the line-item revenue transform to validate the pipeline from outside the warehouse.
-[`notebooks/int_order_items_priced.ipynb`](./notebooks/int_order_items_priced.ipynb) - reimplements transaction-time pricing logic and reconciles the output against the dbt/Snowflake result.
-
-
-## Design Decisions
- ### Tables vs Views
-   Intermediates use views rather than dbt's more common ephermeral default, because the dashboard queries both intermediate views for the price-pass through tab. Ephemeral models don't exist as queryable objects outside of dbt's own compile graph. They only exist as inlined CTEs within whatever references them.
-
- ### Transaction time pricing
-  Revenue calculations use `order_items.unit_price` rather than joining to `menu_items.base_price` because the former yields the transaction time price snapshot. The base price table only holds the current state price and using that would silently overstate the historical revenue before the price increase. The third tab of the dashboard validates this, we see that the transaction time pricing accurately reflects ~1.08 average realized price ratio which is consistent with the price increase.
-  
-  
-  ### Cleaning/deduping
-   Deduping runs before joining to line-item order, post join the revenue would be double counted for every duplicate row. We choose one of the duplicates to keep, since they're byte identical the one we pick isn't important -> ` ROW_NUMBER() PARTITION BY order_id ORDER BY order_timestamp`
- 
-  Note: Ordering by the timestamp here doesn't matter nor does it guaranteed take the first entry since they're byte identical, we use it to just deterministically pick one.
-
-  Honest Caveats: "This dedup logic assumes byte identical duplicates which won't always be the case in production scenario - e.g. retried submissions or sync conflicts. In those cases we would need to consider similar entries with slightly differing fields (duplicate landing across a price change boundary). It's not currently addresed in this implementation.
-
- ### Revenue Grain
-Two approaches to pick from here - the easy path would be to select all orders with status = 'completed' and use that subgroup to pull the revenue. However, I rejected this method because cancelled and refunded orders are still legitimate business signals. Cancelled orders technically don't represent a real transaction so they're excluded entirely upstream of the join. We relationship we can define then is `net revenue = gross revenue - refunded amount`.
-
-### Absence of order_total in raw
-The generator omits order_total, so revenue is derived bottom-up from order_items.unit_price. A stored total, if present, would be transaction-time-safe by construction — computed once, at order time, never recalculated. A derived total is only as safe as the snapshotting discipline behind it: aggregating from unit_price preserves that safety, but the risk is real if a derivation mistakenly joins to menu_items.base_price instead, which is exactly the bug the transaction-time-pricing design decision is meant to prevent. In a system with both, agreement between the stored and derived totals would be a meaningful data-quality signal — and disagreement would point first at whether the derivation is joining to the right price column.
-
-The generator omits order_total, so revenue is derived bottom-up from order_items.unit_price. A stored total, if present, would be transaction-time-safe by construction — computed once, at order time, never recalculated. A derived total is only as safe as the snapshotting discipline behind it: aggregating from unit_price preserves that safety, but the risk is real if a derivation mistakenly joins to menu_items.base_price instead, which is exactly the bug the transaction-time-pricing design decision is meant to prevent. In a system with both, agreement between the stored and derived totals would be a meaningful data-quality signal — and disagreement would point first at whether the derivation is joining to the right price column."
-
-### When Spark, when warehouse
-This project's volume (5K orders) never needed Spark — Snowflake/dbt handled every real transformation here, and that's the honest default up to hundreds of millions of rows, where warehouse SQL gives you testing, lineage, and version control nearly for free. Phase 5's PySpark port of the line-item pricing logic was a deliberate skills exercise, not a data-driven necessity — Spark earns its complexity past single-warehouse scale, or when the transform needs distributed logic SQL can't express cleanly.
-
-### Signup after orders
-The generator intentionally produces some customers with a signup_date after their first order — a plausible real-world pattern (a walk-in customer joining loyalty program after their first visit), not corrupted data. An early version of this check was a dbt test asserting `signup_date <= first_order_date` In practice, `analyses/signup_after_first_order_rate.sql` shows this holds for ~21% of customers (166/800) - too high a rate to be noise, and not actually invalid. A test expected to fail on one in five rows isn't a meaninful test, so the check was moved to an analysis reporting the rate directly, and a boolean flag (`signup_after_first_order`) was added to `dim_customers` so the pattern is queryable rather than either silently ignored or treated as a pipeline failure.
 

@@ -11,3 +11,6 @@ profiles.yml
 raw_data/
 .streamlit/secrets.toml
 .streamlit_keys/
+CLAUDE.md
+docs/clover/snapshots/
+docs/private/

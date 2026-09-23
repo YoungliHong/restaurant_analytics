@@ -252,7 +252,7 @@ graph LR
     int_order_items_priced --> fct_revenue_by_restaurant_category_month
     int_orders_deduped --> fct_revenue_by_restaurant_category_month
 ```
-*Note: Graph is rendered via Mermaid from `manifest.json`'s `parent_map`, since `dbt docs generate` isn't fully supported under the dbt Fusion engine (alpha) used here.*
+*Note: Graph is rendered via Mermaid from `manifest.json`'s `parent_map`, since `dbt docs generate` isn't fully supported under dbt-core 2.0.0a2 (alpha), used here.*
 
 
 ## Design Decisions

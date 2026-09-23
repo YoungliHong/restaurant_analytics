@@ -1,0 +1,45 @@
+{
+  "id": "ORD_FAKE_0003",
+  "currency": "USD",
+  "employee": {"id": "EMP_FAKE_01"},
+  "total": 2145,
+  "state": "open",
+  "testMode": true,
+  "createdTime": 1735301000000,
+  "clientCreatedTime": 1735301000000,
+  "modifiedTime": 1735301200000,
+  "paymentState": "PAID",
+  "discounts": {
+    "elements": [
+      {"id": "DISC_FAKE_ORDER_01", "name": "Loyalty 10% off", "percentage": 10}
+    ]
+  },
+  "lineItems": {
+    "elements": [
+      {
+        "id": "LI_FAKE_0001",
+        "name": "Fake Burrito Bowl",
+        "price": 1195,
+        "unitQty": 1,
+        "modifications": {
+          "elements": [
+            {"id": "MOD_FAKE_01", "name": "Extra guac", "amount": 200},
+            {"id": "MOD_FAKE_02", "name": "No rice", "amount": 0}
+          ]
+        }
+      },
+      {
+        "id": "LI_FAKE_0002",
+        "name": "Fake Fountain Drink",
+        "price": 300,
+        "unitQty": 1,
+        "refunded": false
+      }
+    ]
+  },
+  "payments": {
+    "elements": [
+      {"id": "PAY_FAKE_0001", "amount": 2145, "result": "SUCCESS", "tender": {"label": "Credit Card"}}
+    ]
+  }
+}

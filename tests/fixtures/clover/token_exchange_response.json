@@ -1,0 +1,6 @@
+{
+  "access_token": "FAKE_ACCESS_TOKEN_INITIAL",
+  "access_token_expiration": 1735300800,
+  "refresh_token": "FAKE_REFRESH_TOKEN_INITIAL",
+  "refresh_token_expiration": 1766836800
+}

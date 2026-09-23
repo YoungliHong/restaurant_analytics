@@ -1,0 +1,37 @@
+{
+  "id": "ORD_FAKE_0004",
+  "currency": "USD",
+  "employee": {"id": "EMP_FAKE_01"},
+  "total": 950,
+  "state": "locked",
+  "testMode": true,
+  "createdTime": 1735302000000,
+  "clientCreatedTime": 1735302000000,
+  "modifiedTime": 1735305600000,
+  "paymentState": "CREDITED",
+  "lineItems": {
+    "elements": [
+      {
+        "id": "LI_FAKE_0003",
+        "name": "Fake Taco Plate",
+        "price": 950,
+        "unitQty": 1,
+        "refunded": true
+      }
+    ]
+  },
+  "payments": {
+    "elements": [
+      {
+        "id": "PAY_FAKE_0002",
+        "amount": 950,
+        "result": "SUCCESS",
+        "refunds": {
+          "elements": [
+            {"id": "REFUND_FAKE_0001", "amount": 950, "createdTime": 1735305600000}
+          ]
+        }
+      }
+    ]
+  }
+}

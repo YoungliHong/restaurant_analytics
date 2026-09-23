@@ -1,0 +1,30 @@
+{
+  "elements": [
+    {
+      "id": "ORD_FAKE_0001",
+      "currency": "USD",
+      "employee": {"id": "EMP_FAKE_01"},
+      "total": 1450,
+      "state": "open",
+      "testMode": true,
+      "createdTime": 1735300000000,
+      "clientCreatedTime": 1735300000000,
+      "modifiedTime": 1735300000000,
+      "paymentState": "PAID",
+      "title": "Order"
+    },
+    {
+      "id": "ORD_FAKE_0002",
+      "currency": "USD",
+      "employee": {"id": "EMP_FAKE_01"},
+      "total": 875,
+      "state": "locked",
+      "testMode": true,
+      "createdTime": 1735300500000,
+      "clientCreatedTime": 1735300500000,
+      "modifiedTime": 1735300500000,
+      "paymentState": "PAID",
+      "title": "Order"
+    }
+  ]
+}

@@ -14,3 +14,14 @@ raw_data/
 CLAUDE.md
 docs/clover/snapshots/
 docs/private/
+data/private/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Clover OAuth token storage — default path is ~/.clover (outside the
+# repo), but ignore a repo-local one too in case a run points here.
+.clover/
+*.token.json

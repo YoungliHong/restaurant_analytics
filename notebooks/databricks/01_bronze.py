@@ -157,3 +157,15 @@ display(spark.createDataFrame(pd.DataFrame(rows)))
 # COMMAND ----------
 
 display(spark.sql("SELECT * FROM workspace.bronze.orders LIMIT 10"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC `printSchema` closes the loop on the all-string claim above: a sample
+# MAGIC row can *look* like it's all strings while a numeric-looking column
+# MAGIC (`order_id`, `restaurant_id`, `customer_id`) was actually inferred as an
+# MAGIC int — this confirms the schema itself, not just the printed values.
+
+# COMMAND ----------
+
+spark.table("workspace.bronze.orders").printSchema()

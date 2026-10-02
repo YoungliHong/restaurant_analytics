@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Silver layer: dedup, transaction-time pricing, dbt-exact typing
 # MAGIC
@@ -26,6 +30,10 @@
 
 # COMMAND ----------
 
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, trim, nullif, lit, lower, when, row_number, sum as spark_sum
+from pyspark.sql.window import Window
+
 spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.silver")
 
 bronze_restaurants = spark.table("workspace.bronze.restaurants")
@@ -49,8 +57,6 @@ bronze_order_items = spark.table("workspace.bronze.order_items")
 # COMMAND ----------
 
 print("spark.sql.ansi.enabled =", spark.conf.get("spark.sql.ansi.enabled"))
-
-from pyspark.sql.functions import col
 
 test_df = spark.createDataFrame([("not_a_number",)], ["bad_value"])
 try:
@@ -108,7 +114,6 @@ print("byte-identical duplicates confirmed:", distinct_full_rows == distinct_ord
 
 # COMMAND ----------
 
-from pyspark.sql import DataFrame
 
 
 def clean_restaurants(bronze_df: DataFrame) -> DataFrame:
@@ -128,9 +133,16 @@ def clean_restaurants(bronze_df: DataFrame) -> DataFrame:
     carry them through or drop them; that's a Databricks-specific call,
     not something to match against dbt.
 
-    TODO: implement the rename + casts above.
     """
-    return bronze_df
+    
+    return bronze_df.select(
+      col("restaurant_id").cast("int").alias("restaurant_id"),
+      col("name").alias("restaurant_name"),
+      col("city"),
+      col("state"),
+      col("opened_date").cast("date").alias("opened_date"),
+      col("_ingested_at")
+    )
 
 
 def clean_menu_items(bronze_df: DataFrame) -> DataFrame:
@@ -147,9 +159,14 @@ def clean_menu_items(bronze_df: DataFrame) -> DataFrame:
     No trimming/casing cleanup — dbt applies none to this table.
     Output columns, in order: menu_item_id, item_name, category, base_price.
 
-    TODO: implement the casts above.
     """
-    return bronze_df
+    return bronze_df.select(
+      col("menu_item_id").cast("int").alias("menu_item_id"),
+      col("item_name"),
+      col("category"),
+      col("base_price").cast("decimal(10,2)").alias("base_price"),
+      col("_ingested_at")
+    )
 
 
 def clean_customers(bronze_df: DataFrame) -> DataFrame:
@@ -179,9 +196,17 @@ def clean_customers(bronze_df: DataFrame) -> DataFrame:
     Output columns, in order: customer_id, first_name, last_name, email,
     phone, signup_date, loyalty_tier.
 
-    TODO: implement the casts + trim/nullif logic above.
     """
-    return bronze_df
+    return bronze_df.select(
+      col("customer_id").cast("int").alias("customer_id"),
+      col("first_name"),
+      col("last_name"),
+      nullif(trim(col("email")), lit("")).alias("email"),
+      col("phone"),
+      col("signup_date").cast("date").alias("signup_date"),
+      col("loyalty_tier"),
+      col("_ingested_at")
+    )
 
 
 def clean_order_items(bronze_df: DataFrame) -> DataFrame:
@@ -201,9 +226,15 @@ def clean_order_items(bronze_df: DataFrame) -> DataFrame:
     Output columns, in order: order_item_id, order_id, menu_item_id,
     quantity, unit_price.
 
-    TODO: implement the casts above.
     """
-    return bronze_df
+    return bronze_df.select(
+      col("order_item_id").cast("int").alias("order_item_id"),
+      col("order_id").cast("int").alias("order_id"),
+      col("menu_item_id").cast("int").alias("menu_item_id"),
+      col("quantity").cast("int").alias("quantity"),
+      col("unit_price").cast("decimal(10,2)").alias("unit_price"),
+      col("_ingested_at")
+    )
 
 
 def clean_orders(bronze_df: DataFrame) -> DataFrame:
@@ -238,9 +269,21 @@ def clean_orders(bronze_df: DataFrame) -> DataFrame:
     Output columns, in order: order_id, restaurant_id, customer_id,
     order_timestamp, order_type, payment_method, status.
 
-    TODO: implement the casts + order_type/payment_method cleanup above.
     """
-    return bronze_df
+    pm = lower(trim(col("payment_method")))
+    return bronze_df.select(
+      col("order_id").cast("int").alias("order_id"),
+      col("restaurant_id").cast("int").alias("restaurant_id"),
+      col("customer_id").cast("int").alias("customer_id"),
+      col("order_timestamp").cast("timestamp_ntz").alias("order_timestamp"),
+      lower(trim(col("order_type"))).alias("order_type"),
+      when(pm == "mobile pay", "mobile_pay")
+      .when(pm == "giftcard", "gift_card")
+      .otherwise(pm)
+      .alias("payment_method"),
+      col("status").alias("status"),
+      col("_ingested_at")
+    )
 
 # COMMAND ----------
 
@@ -260,7 +303,7 @@ def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
     Rule: row_number() over (partition by order_id order by
     order_timestamp desc), keep rn = 1, drop the helper column.
 
-    The ordering is arbitrary, not a meaningful tiebreak — per the 2b
+    The ordering is arbitratry, not a meaningful tiebreak — per the 2b
     pre-check and the README's own Design Decisions caveat, the ~0.4%
     duplicate rows are byte-identical, so any deterministic pick is
     correct. order_timestamp desc is just what dbt happens to use.
@@ -268,10 +311,15 @@ def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
     Expected result once implemented: exactly 5,000 rows (5,020 bronze
     rows minus the 20 confirmed-identical duplicates), one row per
     distinct order_id.
-
-    TODO: implement the row_number/filter logic above.
     """
-    return cleaned_orders_df
+    window_spec = Window.partitionBy("order_id").orderBy(col("order_timestamp").desc())
+    return (
+      cleaned_orders_df
+      .withColumn("row_num", row_number().over(window_spec)) 
+      .filter(col("row_num") == 1) 
+      .drop("row_num")
+    )
+
 
 # COMMAND ----------
 
@@ -311,11 +359,18 @@ def price_order_items(cleaned_order_items_df: DataFrame, deduped_orders_df: Data
     Output columns, in order: order_item_id, order_id, menu_item_id,
     quantity, unit_price, line_item_revenue.
 
-    TODO: implement the join + line_item_revenue computation above. Stub
-    ignores deduped_orders_df entirely, just to keep the notebook runnable
-    end to end before this is filled in.
+    line_item_revenue is cast to DECIMAL(12,2): scale 2 matches the cents in unit_price, so no rounding happens, and precision 12 leaves ample headroom for quantity × price at this dataset's scale. Under ANSI mode, an overflow would raise an error rather than silently produce null.
     """
-    return cleaned_order_items_df
+    return cleaned_order_items_df.join(deduped_orders_df, "order_id", how = "inner").select(
+        col("order_item_id"),
+        col("order_id"),
+        col("menu_item_id"),
+        col("quantity"),
+        col("unit_price"),
+        (col("quantity") * col("unit_price")).cast("decimal(12,2)").alias("line_item_revenue"),
+        deduped_orders_df["_ingested_at"]
+    )
+    
 
 # COMMAND ----------
 
@@ -347,7 +402,7 @@ SILVER_TABLES = {
 }
 
 for name, df in SILVER_TABLES.items():
-    df.write.format("delta").mode("overwrite").saveAsTable(f"workspace.silver.{name}")
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"workspace.silver.{name}")
     print(f"wrote workspace.silver.{name}: {df.count():,} rows")
 
 # COMMAND ----------
@@ -355,12 +410,7 @@ for name, df in SILVER_TABLES.items():
 # MAGIC %md
 # MAGIC ## 7. Verification
 # MAGIC
-# MAGIC Row counts, schemas, and a per-column casting-null check. Until the
-# MAGIC functions above are filled in, every stub is an identity passthrough,
-# MAGIC so these numbers will reflect bronze, not the real silver output —
-# MAGIC that's expected, not a bug. `orders` is the clearest signal: it should
-# MAGIC read 5,020 (bronze, pre-dedup) until `dedup_orders` is implemented, and
-# MAGIC exactly 5,000 once it is.
+# MAGIC Row counts, schemas, and a per-column casting-null check. 
 
 # COMMAND ----------
 
@@ -396,15 +446,16 @@ for name in SILVER_TABLES:
 
 def count_casting_nulls(bronze_df, silver_df, pk_col, compare_cols):
     """compare_cols: list of (bronze_col_name, silver_col_name) pairs."""
+    
+    b = bronze_df.alias("b")
+    s = silver_df.alias("s")
+    joined = b.join(s, col(f"b.{pk_col}").cast("int") == col(f"s.{pk_col}"), "inner")
     results = {}
     for bronze_col, silver_col in compare_cols:
         if silver_col not in silver_df.columns:
             results[silver_col] = "not present yet (stub not filled in)"
             continue
-        joined = bronze_df.select(pk_col, bronze_col).join(
-            silver_df.select(pk_col, silver_col), on=pk_col, how="inner"
-        )
-        bad = joined.filter(col(bronze_col).isNotNull() & col(silver_col).isNull()).count()
+        bad = joined.filter(col(f"b.{bronze_col}").isNotNull() & col(f"s.{silver_col}").isNull()).count()
         results[silver_col] = bad
     return results
 
@@ -442,3 +493,90 @@ checks = {
 for table, cols in checks.items():
     for col_name, bad_count in cols.items():
         print(f"{table}.{col_name}: {bad_count} casting-introduced nulls")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC %md
+# MAGIC ## 8. Silver checks: logic assertions
+# MAGIC
+# MAGIC Section 7's verification covers structure (row counts, schemas, and
+# MAGIC nulls introduced by casting). This section checks that the *logic* did
+# MAGIC what the dbt spec says, against known expected values:
+# MAGIC
+# MAGIC - **orders:** dedup left exactly one row per `order_id`; `order_type`,
+# MAGIC   `payment_method`, and `status` contain only their canonical values;
+# MAGIC   guest orders (null `customer_id`) were preserved, not dropped.
+# MAGIC - **customers:** no blank `email` or `phone` survived the trim-then-nullif
+# MAGIC   cleanup.
+# MAGIC - **order_items:** every line item has a `line_item_revenue`; one row is
+# MAGIC   spot-checked by hand, and the revenue total is printed for comparison
+# MAGIC   with the earlier PySpark notebook.
+# MAGIC
+# MAGIC Fixed expectations are `assert`s, so a regression fails loudly on rerun.
+
+# COMMAND ----------
+
+
+"""
+Orders:
+
+1. distinct order_id = 5,000
+2. order_type values exactly {dine_in, takeout, delivery}
+3. payment_method values exactly {card, cash, mobile_pay, gift_card}
+4. status values exactly {completed, cancelled, refunded}
+5. null customer_id count = spark.table("workspace.bronze.orders").dropDuplicates(["order_id"]).filter(col("customer_id").isNull()).count()
+"""
+distinct_orders = spark.table("workspace.silver.orders").select("order_id").distinct().count()
+assert distinct_orders == 5000, f"orders: expected 5000 distinct order_ids, got {distinct_orders}"
+
+def distinct_values(table, column):
+    rows = spark.table(table).select(column).distinct().collect()
+    return {row[column] for row in rows}
+
+expected_order_types = {"dine_in", "takeout", "delivery"}
+actual = distinct_values("workspace.silver.orders", "order_type")
+assert actual == expected_order_types, f"order_type: expected {expected_order_types}, got {actual}"
+
+expected_payment_methods = {"card", "cash", "mobile_pay", "gift_card"}
+actual = distinct_values("workspace.silver.orders", "payment_method")
+assert actual == expected_payment_methods, f"payment_method: expected {expected_payment_methods}, got {actual}"
+
+expected_status = {"completed", "cancelled", "refunded"}
+actual = distinct_values("workspace.silver.orders", "status")
+assert actual == expected_status, f"status: expected {expected_status}, got {actual}"
+
+expected_guests = spark.table("workspace.bronze.orders").dropDuplicates(["order_id"]).filter(col("customer_id").isNull()).count()
+actual_guests = spark.table("workspace.silver.orders").filter(col("customer_id").isNull()).count()
+assert expected_guests == actual_guests, f"orders: expected {expected_guests} guest orders, got {actual_guests}"
+
+"""
+Customers
+
+1. zero blank email or phone after trimming
+"""
+customers = spark.table("workspace.silver.customers")
+blank_emails = customers.filter(trim(col("email")) == "").count()
+blank_phones = customers.filter(trim(col("phone")) == "").count()
+assert blank_emails == 0, f"customers: expected 0 blank emails, got {blank_emails}"
+assert blank_phones == 0, f"customers: expected 0 blank phone numbers, got {blank_phones}"
+
+"""
+Order items
+
+1. zero null line_item_revenue
+2. a one-row spot-check of quantity × unit_price
+3. print sum(line_item_revenue)
+"""
+items = spark.table("workspace.silver.order_items")
+null_revenue = items.filter(col("line_item_revenue").isNull()).count()
+assert null_revenue == 0, f"order_items: expected 0 null line_item_revenue, got {null_revenue}"
+
+mismatches = items.filter(col("quantity") * col("unit_price") != col("line_item_revenue")).count()
+assert mismatches == 0, f"order_items: {mismatches} rows where quantity * unit_price != line_item_revenue"
+
+display(items.select("order_item_id", "quantity", "unit_price", "line_item_revenue").limit(5))
+
+total = items.agg(spark_sum("line_item_revenue")).first()[0]
+print(f"Total line_item_revenue: ${total:,.2f}")
+

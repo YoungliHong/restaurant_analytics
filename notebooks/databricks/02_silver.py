@@ -202,7 +202,7 @@ def clean_customers(bronze_df: DataFrame) -> DataFrame:
       col("first_name"),
       col("last_name"),
       nullif(trim(col("email")), lit("")).alias("email"),
-      col("phone"),
+      nullif(trim(col("phone")), lit("")).alias("phone"),
       col("signup_date").cast("date").alias("signup_date"),
       col("loyalty_tier"),
       col("_ingested_at")

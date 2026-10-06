@@ -76,6 +76,8 @@ from pyspark.sql.types import (
     TimestampNTZType,
 )
 
+from pyspark.testing import assertSchemaEqual
+
 spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.gold")
 
 silver_restaurants = spark.table("workspace.silver.restaurants")
@@ -204,8 +206,13 @@ def build_dim_restaurants(silver_restaurants_df: DataFrame) -> DataFrame:
 
     Drop _ingested_at (gold lineage decision).
     """
-    # TODO: select the five columns in order.
-    return _empty(DIM_RESTAURANTS_SCHEMA)
+    return silver_restaurants_df.select(
+      col("restaurant_id"),
+      col("restaurant_name"),
+      col("city"),
+      col("state"),
+      col("opened_date")
+    )
 
 
 def build_dim_menu_items(silver_menu_items_df: DataFrame) -> DataFrame:
@@ -229,8 +236,12 @@ def build_dim_menu_items(silver_menu_items_df: DataFrame) -> DataFrame:
 
     Drop _ingested_at.
     """
-    # TODO: select + rename.
-    return _empty(DIM_MENU_ITEMS_SCHEMA)
+    return silver_menu_items_df.select(
+      col("menu_item_id"),
+      col("item_name"),
+      col("category"),
+      col("base_price").alias("current_base_price")
+    )
 
 
 def build_dim_customers(silver_customers_df: DataFrame, silver_orders_df: DataFrame) -> DataFrame:
@@ -267,16 +278,37 @@ def build_dim_customers(silver_customers_df: DataFrame, silver_orders_df: DataFr
       first_order_timestamp        TimestampNTZType (TIMESTAMP_NTZ; null if no orders)
       is_signup_after_first_order  BooleanType      (BOOLEAN; never null)
 
-    Aliases: both inputs carry `customer_id` and `_ingested_at`, so alias
+    ~~Aliases: both inputs carry `customer_id` and `_ingested_at`, so alias
     both sides (e.g. "c" / "fo") and select qualified columns. This DataFrame
     is later joined alongside silver_orders again in fct_price_ratio_by_tier,
-    so leave no stray orders-side columns on the output.
+    so leave no stray orders-side columns on the output.~~
+
+    Note no aliases needed: first_orders is aggregated (only customer_id and first_order_timestamp survive the groupBy) and joined on the string key, so no column is ambiguous.
 
     Drop _ingested_at. Reference value from the README's analysis: ~166 of
     800 customers flagged true.
     """
-    # TODO: first_orders aggregate, left join, flag expression, final select.
-    return _empty(DIM_CUSTOMERS_SCHEMA)
+    first_orders = silver_orders_df \
+      .filter(col("customer_id").isNotNull()) \
+        .groupBy("customer_id") \
+          .agg(spark_min(col("order_timestamp")).alias("first_order_timestamp"))
+    joined = silver_customers_df.join(first_orders, on = "customer_id", how = "left")
+    return joined.select(
+      col("customer_id"),
+      col("first_name"),
+      col("last_name"),
+      col("email"),
+      col("phone"),
+      col("signup_date"),
+      col("loyalty_tier"),
+      col("first_order_timestamp"),
+      when(
+        col("first_order_timestamp").isNotNull() 
+        & (col("first_order_timestamp") < col("signup_date").cast("timestamp_ntz")),
+        True
+        ).otherwise(False).alias("is_signup_after_first_order")
+      )
+      
 
 # COMMAND ----------
 
@@ -553,6 +585,43 @@ for name, df in GOLD_TABLES.items():
 # MAGIC
 # MAGIC Row counts and schemas, read back from the written tables. Structure
 # MAGIC only — logic checks go in your own section after this one.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Dimension building validation
+# MAGIC
+# MAGIC Expected outputs:
+# MAGIC * Row counts: dim_restaurants 4, dim_menu_items 38, dim_customers 800
+# MAGIC * printSchema against the docstring types, especially current_base_price as decimal(10,2), first_order_timestamp as timestamp_ntz, and is_signup_after_first_order as boolean
+# MAGIC * The flag: about 166 true. Also confirm zero nulls in the flag, since the docstring says it's never null.
+# MAGIC * IDs are unique, per the dbt tests: distinct customer_id = 800, distinct menu_item_id = 38, distinct restaurant_id = 4
+
+# COMMAND ----------
+
+# Row counts
+dim_tables = {"dim_restaurants": 4, "dim_menu_items": 38, "dim_customers": 800}
+for t, n in dim_tables.items():
+    dim_rows = spark.table(f"workspace.gold.{t}").count()
+    assert dim_rows == n, f"{t}: expected {n} rows, got {dim_rows}"
+
+# Schema Validation
+dim_tables_schemas = {"dim_restaurants": DIM_RESTAURANTS_SCHEMA, "dim_menu_items": DIM_MENU_ITEMS_SCHEMA, "dim_customers": DIM_CUSTOMERS_SCHEMA}
+for t, schema in dim_tables_schemas.items():
+    assertSchemaEqual(spark.table(f"workspace.gold.{t}").schema, schema)
+
+# Flagging Validation
+flagged = spark.table("workspace.gold.dim_customers").filter(col("is_signup_after_first_order")).count()
+assert flagged == 166, f"dim_customers: expected 166 flagged, got {flagged}"
+
+null_flags = spark.table("workspace.gold.dim_customers").filter(col("is_signup_after_first_order").isNull()).count()
+assert null_flags == 0, f"dim_customers: expected zero null is_signup_after_first_order flags, got {null_flags}"
+
+# Order/Item ID Uniqueness
+table_ids = {"dim_customers": ("customer_id", 800), "dim_menu_items": ("menu_item_id", 38), "dim_restaurants": ("restaurant_id", 4)}
+for t, (id_col, expected_rows) in table_ids.items():
+    id_count = spark.table(f"workspace.gold.{t}").select(id_col).distinct().count()
+    assert id_count == expected_rows, f"{t}: expected {expected_rows} unique {id_col}, got {id_count}"
 
 # COMMAND ----------
 

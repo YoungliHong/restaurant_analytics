@@ -366,9 +366,27 @@ def build_fct_orders(silver_orders_df: DataFrame, silver_order_items_df: DataFra
     Drop _ingested_at. Reference value: sum(order_total) should equal the
     total line_item_revenue from silver, $180,604.30 (README Spark section).
     """
-    # TODO: aggregate line items per order, left join, select + cast.
-    return _empty(FCT_ORDERS_SCHEMA)
-
+    order_aggregate = silver_order_items_df \
+      .groupBy("order_id") \
+        .agg(
+          count("*").alias("item_count"),
+          spark_sum(col("quantity")).alias("total_quantity"),
+          spark_sum(col("line_item_revenue")).cast("decimal(38,2)").alias("order_total")
+          )
+    return silver_orders_df \
+      .join(order_aggregate, on = "order_id", how = "left") \
+      .select(
+        col("order_id"),
+        col("restaurant_id"),
+        col("customer_id"),
+        col("order_timestamp"),
+        col("order_type"),
+        col("payment_method"),
+        col("status"),
+        col("item_count"),
+        col("total_quantity"),
+        col("order_total")
+      )
 
 def build_fct_revenue_by_restaurant_category_month(
     silver_order_items_df: DataFrame,
@@ -424,12 +442,54 @@ def build_fct_revenue_by_restaurant_category_month(
     the latter, `trunc(to_date(ts), 'MM')` -> cast to timestamp_ntz avoids any
     timezone path entirely. Your call; document it.
 
+    > date_trunc on a TIMESTAMP_NTZ input returned a session-timezone TIMESTAMP (verified with printSchema). Values were correct only because the session timezone is UTC. Using trunc(to_date(...), 'MM') cast to timestamp_ntz instead, which never touches a timezone
+
     Aliases: order_items and orders both carry `order_id` and `_ingested_at`;
     alias all three inputs and select qualified columns.
     Drop _ingested_at.
     """
-    # TODO: three-way inner join, filter, row-level month/revenue, aggregate, net_revenue, cast.
-    return _empty(FCT_REVENUE_SCHEMA)
+    joined = (
+      silver_order_items_df
+        .join(silver_orders_df, on = "order_id", how = "inner")
+        .join(silver_menu_items, on ="menu_item_id", how = "inner")
+        .select(
+          col("order_id"),
+          col("restaurant_id"),
+          col("category"),
+          trunc(to_date(col("order_timestamp")), "MM").cast("timestamp_ntz").alias("month"),
+          col("status"),
+          col("quantity"  ),
+          (col("quantity") * col("unit_price")).alias("revenue"),
+        ).filter(
+          col("status") != "cancelled"
+        )
+    )
+  
+    agg = (
+      joined
+        .groupBy(
+          ["restaurant_id", "category", "month"]
+        ).agg(
+          spark_sum(when(col("status").isin("completed", "refunded"), col("revenue")).otherwise(0)).alias("gross_revenue"),
+          spark_sum(when(col("status") == "refunded", col("revenue")).otherwise(0)).alias("refunded_amount"),
+          spark_sum(col("quantity")).alias("units_sold"),
+          count_distinct("order_id").alias("order_count"),
+          count_distinct(when(col("status") == "refunded", col("order_id"))).alias("refunded_order_count")
+        )
+    )
+
+    final = agg.select(
+      col("restaurant_id"),
+      col("category"),
+      col("month"),
+      col("gross_revenue").cast("decimal(38,2)"),
+      col("refunded_amount").cast("decimal(38,2)"),
+      col("units_sold"),
+      col("order_count"),
+      col("refunded_order_count"),
+      (col("gross_revenue") - col("refunded_amount")).alias("net_revenue").cast("decimal(38,2)")
+    )
+    return final
 
 
 def build_fct_item_demand_by_hour(
@@ -449,7 +509,7 @@ def build_fct_item_demand_by_hour(
       order_items INNER JOIN orders     ON order_items.order_id = orders.order_id
                   INNER JOIN menu_items ON order_items.menu_item_id = menu_items.menu_item_id
       menu_items is the gold dim_menu_items DataFrame.
-    Filter: orders.status != 'cancelled'.
+    Filter: orders.status != 'cancelled'
 
     Row-level: hour_of_day = hour(orders.order_timestamp)  (0-23, from the NTZ
     wall-clock value — no timezone conversion should occur).
@@ -471,8 +531,32 @@ def build_fct_item_demand_by_hour(
     Drop _ingested_at. Sanity reference: lunch/dinner peaks near 12 and 19
     (README Dashboard Tab 2, generator HOUR_WEIGHTS).
     """
-    # TODO: three-way inner join, filter, hour_of_day, aggregate.
-    return _empty(FCT_ITEM_DEMAND_SCHEMA)
+    
+    joined = (
+      silver_order_items_df
+        .join(silver_orders_df, on = "order_id", how = "inner")
+        .join(dim_menu_items_df, on ="menu_item_id", how = "inner")
+        .select(
+          col("menu_item_id"),
+          col("item_name"),
+          col("category"),
+          hour(col("order_timestamp")).alias("hour_of_day"),
+          col("order_id"),
+          col("quantity")
+        ).filter(
+          col("status") != "cancelled"
+        )
+    )
+    final = joined.groupBy(
+      ["menu_item_id",
+       "item_name",
+       "category",
+       "hour_of_day"]
+    ).agg(
+      spark_sum(col("quantity")).alias("units_sold"),
+      count_distinct("order_id").alias("order_count")
+    )
+    return final
 
 
 def build_fct_price_ratio_by_tier(
@@ -533,10 +617,55 @@ def build_fct_price_ratio_by_tier(
          joined here alongside silver_orders; both carry customer_id.
          Alias orders and customers and select qualified columns.
 
+    >Aliases not needed: pre/post measure columns are renamed before the join, so the only shared column is the string join key loyalty_tier, which Spark merges.
+
     Drop _ingested_at.
     """
-    # TODO: join + filter, tier/period/revenue, agg, pre/post split, self-join, ratios, cast.
-    return _empty(FCT_PRICE_RATIO_SCHEMA)
+    joined = (silver_order_items_df
+              .join(silver_orders_df, on="order_id", how="inner")
+              .join(dim_customers_df, on="customer_id", how="left")
+              .filter(col("status") != "cancelled")
+              .select(
+                  coalesce(col("loyalty_tier"), lit("guest")).alias("loyalty_tier"),
+                  when(to_date(col("order_timestamp")) >= (lit("2024-07-01").cast("date")), "post").otherwise("pre").alias("period"),
+                  col("quantity"),
+                  (col("quantity") * col("unit_price")).alias("revenue")
+              )
+    )
+    agg = (joined
+           .groupBy("loyalty_tier", "period")
+           .agg(
+               spark_sum("quantity").alias("units_sold"),
+               spark_sum("revenue").cast("decimal(38,2)").alias("total_revenue")
+           ))
+    pre = (agg
+           .filter(col("period") == "pre")
+           .select(
+             col("loyalty_tier"),
+             col("units_sold").alias("pre_units"),
+             col("total_revenue").alias("pre_revenue")
+           ))
+    post = (agg
+            .filter(col("period") == "post")
+            .select(
+              col("loyalty_tier"),
+              col("units_sold").alias("post_units"),
+              col("total_revenue").alias("post_revenue")
+            )
+    )
+    final = (pre
+             .join(post, on = "loyalty_tier", how = "inner")
+             .select(
+                col("loyalty_tier"),
+                col("pre_units"),
+                col("post_units"),
+                (col("post_units").cast("double")/col("pre_units")).alias("units_ratio"),
+                col("pre_revenue"),
+                col("post_revenue"),
+                (col("post_revenue").cast("double")/col("pre_revenue")).alias("revenue_ratio")
+             )
+    )
+    return final
 
 # COMMAND ----------
 
@@ -580,6 +709,15 @@ for name, df in GOLD_TABLES.items():
 
 # COMMAND ----------
 
+test = spark.table("workspace.silver.orders").select(
+    col("order_timestamp"),
+    date_trunc("month", col("order_timestamp")).alias("month"),
+)
+test.printSchema()
+display(test.limit(5))
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 6. Verification
 # MAGIC
@@ -589,7 +727,7 @@ for name, df in GOLD_TABLES.items():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Dimension building validation
+# MAGIC ## Silver Layer Validation
 # MAGIC
 # MAGIC Expected outputs:
 # MAGIC * Row counts: dim_restaurants 4, dim_menu_items 38, dim_customers 800
@@ -633,3 +771,56 @@ for name in GOLD_TABLES:
 for name in GOLD_TABLES:
     print(f"--- workspace.gold.{name} ---")
     spark.table(f"workspace.gold.{name}").printSchema()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Gold checks: logic assertions
+# MAGIC
+# MAGIC Structure (row counts, `printSchema`) is covered above. This section checks
+# MAGIC each mart's logic against expected values and the dbt tests from the
+# MAGIC docstrings. Fixed expectations are `assert`s, so regressions fail loudly on
+# MAGIC rerun. Floating-point ratios are printed for inspection, not asserted.
+# MAGIC
+# MAGIC **Shared expected value:** non-cancelled revenue, computed once from silver
+# MAGIC (order_items joined to orders, `status != 'cancelled'`, sum of
+# MAGIC `line_item_revenue`). Used by three of the checks below.
+# MAGIC
+# MAGIC ### All marts
+# MAGIC - `assertSchemaEqual` against each mart's target schema (nullability ignored).
+# MAGIC
+# MAGIC ### Dims
+# MAGIC - **dim_restaurants:** 4 rows; `restaurant_id` unique.
+# MAGIC - **dim_menu_items:** 38 rows; `menu_item_id` unique.
+# MAGIC - **dim_customers:** 800 rows; `customer_id` unique;
+# MAGIC   `is_signup_after_first_order` true for exactly 166 customers and never null.
+# MAGIC
+# MAGIC ### fct_orders
+# MAGIC - 5,000 rows; `order_id` unique.
+# MAGIC - `sum(order_total)` = $180,604.30 (matches silver; cancelled orders included).
+# MAGIC - Every `restaurant_id` exists in `dim_restaurants` (left anti-join count = 0).
+# MAGIC
+# MAGIC ### fct_revenue_by_restaurant_category_month
+# MAGIC - (`restaurant_id`, `category`, `month`) is unique.
+# MAGIC - `gross_revenue = net_revenue + refunded_amount` on every row.
+# MAGIC - `sum(gross_revenue)` = non-cancelled revenue from silver.
+# MAGIC
+# MAGIC ### fct_item_demand_by_hour
+# MAGIC - (`menu_item_id`, `hour_of_day`) is unique.
+# MAGIC - `hour_of_day` between 0 and 23.
+# MAGIC - `sum(units_sold)` = non-cancelled quantity from silver.
+# MAGIC
+# MAGIC ### fct_price_ratio_by_tier
+# MAGIC - `loyalty_tier` is unique (one row per tier).
+# MAGIC - `sum(pre_revenue) + sum(post_revenue)` = non-cancelled revenue from silver,
+# MAGIC   provided every tier appears in both periods (the inner join drops tiers
+# MAGIC   missing from either).
+# MAGIC - Printed, not asserted: `units_ratio` and `revenue_ratio` per tier
+# MAGIC   (`revenue_ratio` expected near the configured 1.08 price increase).
+
+# COMMAND ----------
+
+# Schema Validation
+gold_schemas = {"fct_orders": FCT_ORDERS_SCHEMA, "fct_revenue_by_restaurant_category_month": FCT_REVENUE_SCHEMA, "fct_item_demand_by_hour": FCT_ITEM_DEMAND_SCHEMA, "fct_price_ratio_by_tier": FCT_PRICE_RATIO_SCHEMA}
+for t, schema in dim_tables_schemas.items():
+    assertSchemaEqual(spark.table(f"workspace.gold.{t}").schema, schema)

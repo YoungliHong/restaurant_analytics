@@ -436,7 +436,7 @@ for name in SILVER_TABLES:
 # MAGIC performs the rename) — expected before fill-in, not an error.
 # MAGIC
 # MAGIC `email`/`phone` are deliberately excluded for customers (bronze nulls
-# MAGIC there are expected by design, ~2%/~1%), and `customer_id` is excluded
+# MAGIC there are expected by design, ~ 2%/~1%), and `customer_id` is excluded
 # MAGIC for orders (the ~18% guest-order nulls are legitimate in both layers).
 # MAGIC If the bronze/silver primary-key column types differ (string vs. int)
 # MAGIC once casts are implemented, the join below may need an explicit cast
@@ -520,63 +520,95 @@ for table, cols in checks.items():
 
 """
 Orders:
-
-1. distinct order_id = 5,000
-2. order_type values exactly {dine_in, takeout, delivery}
-3. payment_method values exactly {card, cash, mobile_pay, gift_card}
-4. status values exactly {completed, cancelled, refunded}
-5. null customer_id count = spark.table("workspace.bronze.orders").dropDuplicates(["order_id"]).filter(col("customer_id").isNull()).count()
+1. Uniqueness: distinct order_id = row count (one row per order).
+2. Completeness: row count = distinct order_ids in bronze (dedup removed duplicates and nothing else)
+3. order_type, payment_method, and status contain exactly their canonical values
+4. Guest orders are preserved: null customer_id count = deduped bronze's null count
+All silver tables: uniqueness on the primary key, and completeness against bronze(orders: distinct bronze order_ids; all others: bronze row count, since nothing is deduped or filtered there)
 """
-distinct_orders = spark.table("workspace.silver.orders").select("order_id").distinct().count()
-assert distinct_orders == 5000, f"orders: expected 5000 distinct order_ids, got {distinct_orders}"
+orders = spark.table("workspace.silver.orders")
+bronze_orders = spark.table("workspace.bronze.orders")
+
+orders_total = orders.count()
+distinct_order_ids = orders.select("order_id").distinct().count()
+expected_orders = bronze_orders.select("order_id").distinct().count()
+
+assert distinct_order_ids == orders_total, f"silver orders: {orders_total - distinct_order_ids} duplicate order_ids"
+assert orders_total == expected_orders, f"silver orders: expected {expected_orders} (distinct bronze_ids), got {orders_total}"
+print(f"silver_orders: {orders_total} rows; bronze: {bronze_orders.count()} rows; duplicates removed: {bronze_orders.count() - orders_total}")
 
 def distinct_values(table, column):
     rows = spark.table(table).select(column).distinct().collect()
     return {row[column] for row in rows}
 
-expected_order_types = {"dine_in", "takeout", "delivery"}
-actual = distinct_values("workspace.silver.orders", "order_type")
-assert actual == expected_order_types, f"order_type: expected {expected_order_types}, got {actual}"
+expected_values = {"order_type":{"dine_in", "takeout", "delivery"}, "payment_method": {"cash", "card", "mobile_pay", "gift_card"}, "status": {"completed", "cancelled", "refunded"}}
 
-expected_payment_methods = {"card", "cash", "mobile_pay", "gift_card"}
-actual = distinct_values("workspace.silver.orders", "payment_method")
-assert actual == expected_payment_methods, f"payment_method: expected {expected_payment_methods}, got {actual}"
+for column, expected in expected_values.items():
+    actual = distinct_values("workspace.silver.orders", column)
+    assert actual == expected, f"silver orders.{column}: expected {expected}, got {actual}"
 
-expected_status = {"completed", "cancelled", "refunded"}
-actual = distinct_values("workspace.silver.orders", "status")
-assert actual == expected_status, f"status: expected {expected_status}, got {actual}"
-
-expected_guests = spark.table("workspace.bronze.orders").dropDuplicates(["order_id"]).filter(col("customer_id").isNull()).count()
+expected_guests = bronze_orders.dropDuplicates(["order_id"]).filter(col("customer_id").isNull()).count()
 actual_guests = spark.table("workspace.silver.orders").filter(col("customer_id").isNull()).count()
-assert expected_guests == actual_guests, f"orders: expected {expected_guests} guest orders, got {actual_guests}"
+assert expected_guests == actual_guests, f"silver orders: expected {expected_guests} guest orders, got {actual_guests}"
+
+"""
+All silver tables: uniqueness on the primary key, and completeness against
+bronze (orders: distinct bronze order_ids; all others: bronze row count,
+since nothing is deduped or filtered there).
+"""
+primary_keys = {
+    "restaurants":"restaurant_id",
+    "menu_items":"menu_item_id",
+    "customers":"customer_id",
+    "order_items":"order_item_id",
+}
+
+for name, pk in primary_keys.items():
+    silver = spark.table(f"workspace.silver.{name}")
+    silver_n = silver.count()
+    distinct_n = silver.select(pk).distinct().count()
+    bronze_n = spark.table(f"workspace.bronze.{name}").count()
+    assert distinct_n == silver_n, f"silver {name}: {silver_n - distinct_n} duplicate {pk}s"
+    assert silver_n == bronze_n, f"silver {name}: expected {bronze_n} rows (=bronze), got {silver_n}"
 
 """
 Customers
 
 1. zero blank email or phone after trimming
 """
+
 customers = spark.table("workspace.silver.customers")
 blank_emails = customers.filter(trim(col("email")) == "").count()
 blank_phones = customers.filter(trim(col("phone")) == "").count()
-assert blank_emails == 0, f"customers: expected 0 blank emails, got {blank_emails}"
-assert blank_phones == 0, f"customers: expected 0 blank phone numbers, got {blank_phones}"
+untrimmed =  customers.filter((col("email") != trim(col("email"))) | (col("phone") != trim(col("phone")))).count()
+assert blank_emails == 0, f"silver customers: expected 0 blank emails, got {blank_emails}"
+assert blank_phones == 0, f"silver customers: expected 0 blank phone numbers, got{blank_phones}"
+assert untrimmed == 0, f"silver customers: {untrimmed} rows with untrimmed email or phone"
 
 """
 Order items
 
-1. zero null line_item_revenue
-2. a one-row spot-check of quantity × unit_price
-3. print sum(line_item_revenue)
+1. no null line_item_revenue
+2. line_item_revenue = quantity x unit_price on every row
+3. Sample rows displayed and total revenue printed for inspection
 """
 items = spark.table("workspace.silver.order_items")
 null_revenue = items.filter(col("line_item_revenue").isNull()).count()
-assert null_revenue == 0, f"order_items: expected 0 null line_item_revenue, got {null_revenue}"
+assert null_revenue == 0, f"silver order_items: expected 0 null line_item_revenue, got {null_revenue}"
 
 mismatches = items.filter(col("quantity") * col("unit_price") != col("line_item_revenue")).count()
-assert mismatches == 0, f"order_items: {mismatches} rows where quantity * unit_price != line_item_revenue"
+assert mismatches == 0, f"silver order_items: {mismatches} rows where quantity * unit_price != line_item_revenue"
 
 display(items.select("order_item_id", "quantity", "unit_price", "line_item_revenue").limit(5))
 
 total = items.agg(spark_sum("line_item_revenue")).first()[0]
 print(f"Total line_item_revenue: ${total:,.2f}")
 
+for name in ["restaurants", "menu_items", "customers","order_items"]:
+    bronze_n = spark.table(f"workspace.bronze.{name}").count()
+    silver_n = spark.table(f"workspace.silver.{name}").count()
+    assert silver_n == bronze_n, f"silver {name}: expected {bronze_n} rows (=bronze), got {silver_n}"
+
+untrimmed = customers.filter((col("email") != trim(col("email"))) | (col("phone") != trim(col("phone")))).count()
+assert untrimmed == 0, f"silver customers: {untrimmed} rows with untrimmed email or phone"
+                           

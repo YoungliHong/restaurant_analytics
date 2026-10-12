@@ -727,39 +727,13 @@ display(test.limit(5))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Silver Layer Validation
+# MAGIC ## Dimensions
 # MAGIC
 # MAGIC Expected outputs:
 # MAGIC * Row counts: dim_restaurants 4, dim_menu_items 38, dim_customers 800
 # MAGIC * printSchema against the docstring types, especially current_base_price as decimal(10,2), first_order_timestamp as timestamp_ntz, and is_signup_after_first_order as boolean
 # MAGIC * The flag: about 166 true. Also confirm zero nulls in the flag, since the docstring says it's never null.
 # MAGIC * IDs are unique, per the dbt tests: distinct customer_id = 800, distinct menu_item_id = 38, distinct restaurant_id = 4
-
-# COMMAND ----------
-
-# Row counts
-dim_tables = {"dim_restaurants": 4, "dim_menu_items": 38, "dim_customers": 800}
-for t, n in dim_tables.items():
-    dim_rows = spark.table(f"workspace.gold.{t}").count()
-    assert dim_rows == n, f"{t}: expected {n} rows, got {dim_rows}"
-
-# Schema Validation
-dim_tables_schemas = {"dim_restaurants": DIM_RESTAURANTS_SCHEMA, "dim_menu_items": DIM_MENU_ITEMS_SCHEMA, "dim_customers": DIM_CUSTOMERS_SCHEMA}
-for t, schema in dim_tables_schemas.items():
-    assertSchemaEqual(spark.table(f"workspace.gold.{t}").schema, schema)
-
-# Flagging Validation
-flagged = spark.table("workspace.gold.dim_customers").filter(col("is_signup_after_first_order")).count()
-assert flagged == 166, f"dim_customers: expected 166 flagged, got {flagged}"
-
-null_flags = spark.table("workspace.gold.dim_customers").filter(col("is_signup_after_first_order").isNull()).count()
-assert null_flags == 0, f"dim_customers: expected zero null is_signup_after_first_order flags, got {null_flags}"
-
-# Order/Item ID Uniqueness
-table_ids = {"dim_customers": ("customer_id", 800), "dim_menu_items": ("menu_item_id", 38), "dim_restaurants": ("restaurant_id", 4)}
-for t, (id_col, expected_rows) in table_ids.items():
-    id_count = spark.table(f"workspace.gold.{t}").select(id_col).distinct().count()
-    assert id_count == expected_rows, f"{t}: expected {expected_rows} unique {id_col}, got {id_count}"
 
 # COMMAND ----------
 
@@ -789,12 +763,112 @@ for name in GOLD_TABLES:
 # MAGIC ### All marts
 # MAGIC - `assertSchemaEqual` against each mart's target schema (nullability ignored).
 # MAGIC
-# MAGIC ### Dims
+# MAGIC ### Dimension tables
+# MAGIC - printSchema against the docstring types, especially current_base_price as decimal(10,2), first_order_timestamp as timestamp_ntz, and is_signup_after_first_order as boolean
 # MAGIC - **dim_restaurants:** 4 rows; `restaurant_id` unique.
 # MAGIC - **dim_menu_items:** 38 rows; `menu_item_id` unique.
 # MAGIC - **dim_customers:** 800 rows; `customer_id` unique;
-# MAGIC   `is_signup_after_first_order` true for exactly 166 customers and never null.
-# MAGIC
+# MAGIC -  `is_signup_after_first_order` true for exactly 166 customers and never null.
+
+# COMMAND ----------
+
+
+# shared values
+silver_orders = spark.table("workspace.silver.orders")
+silver_items = spark.table("workspace.silver.order_items")
+
+non_cancelled = (
+    silver_items
+    .join(silver_orders, on="order_id", how="inner")
+    .filter(col("status") != "cancelled")
+)
+nc = non_cancelled.agg(
+    spark_sum("line_item_revenue").alias("revenue"),
+    spark_sum("quantity").alias("quantity")
+).first()
+nc_revenue, nc_quantity = nc["revenue"], nc["quantity"]
+
+all_revenue = silver_items.agg(spark_sum("line_item_revenue")).first()[0]
+print(f"silver revenue: all ${all_revenue:,.2f}; non-cancelled ${nc_revenue:,.2f}; non-cancelled units {nc_quantity}")
+
+# uniqueness
+def assert_unique(table, key_cols):
+    df = spark.table(f"workspace.gold.{table}")
+    total = df.count()
+    distinct_n = df.select(*key_cols).distinct().count()
+    assert distinct_n == total, f"gold {table}: {total - distinct_n} duplicate {key_cols} rows"
+
+assert_unique("dim_restaurants", ["restaurant_id"])
+assert_unique("dim_menu_items", ["menu_item_id"])
+assert_unique("dim_customers", ["customer_id"])
+assert_unique("fct_orders", ["order_id"])
+assert_unique("fct_revenue_by_restaurant_category_month", ["restaurant_id", "category", "month"])
+assert_unique("fct_item_demand_by_hour", ["menu_item_id", "hour_of_day"])
+assert_unique("fct_price_ratio_by_tier", ["loyalty_tier"])
+
+# completeness 
+primary_keys = {
+    "dim_restaurants": "restaurants",
+    "dim_menu_items": "menu_items",
+    "dim_customers": "customers",
+    "fct_orders": "orders"
+}
+
+for name, t in primary_keys.items():
+    gold = spark.table(f"workspace.gold.{name}")
+    gold_n = gold.count()
+    silver_n = spark.table(f"workspace.silver.{t}").count()
+    assert gold_n == silver_n, f"gold {name}: expected {silver_n} rows (=silver), got {gold_n}"
+
+gold_total = spark.table("workspace.gold.fct_orders").agg(spark_sum("order_total")).first()[0]
+assert gold_total == all_revenue, f"gold fct_orders: expected {all_revenue:,.2f}, got {gold_total:,.2f}"
+
+gold_nc = spark.table("workspace.gold.fct_orders").filter(col("status") != "cancelled").agg(spark_sum("order_total")).first()[0]
+assert gold_nc == nc_revenue, f"gold fct_orders: expected non-cancelled ${nc_revenue:,.2f}, got ${gold_nc:,.2f}"
+
+
+# schema validation
+gold_schemas = {
+    "dim_restaurants" : DIM_RESTAURANTS_SCHEMA, 
+    "dim_menu_items" : DIM_MENU_ITEMS_SCHEMA, 
+    "dim_customers": DIM_CUSTOMERS_SCHEMA, 
+    "fct_orders" : FCT_ORDERS_SCHEMA, "fct_revenue_by_restaurant_category_month": FCT_REVENUE_SCHEMA, 
+    "fct_item_demand_by_hour": FCT_ITEM_DEMAND_SCHEMA, "fct_price_ratio_by_tier": FCT_PRICE_RATIO_SCHEMA}
+for t, schema in gold_schemas.items():
+    assertSchemaEqual(spark.table(f"workspace.gold.{t}").schema, schema)
+
+# flag: printed, verified row by row in reconcile
+flagged = spark.table("workspace.gold.dim_customers").filter(col("is_signup_after_first_order")).count()
+print(f"gold dim_customers: {flagged} customers flagged is_signup_after_first_order")
+
+null_flags = spark.table("workspace.gold.dim_customers").filter(col("is_signup_after_first_order").isNull()).count()
+assert null_flags == 0, f"gold dim_customers: expected zero null is_signup_after_first_order flags, got {null_flags}"
+
+# revenue mart
+rev = spark.table("workspace.gold.fct_revenue_by_restaurant_category_month")
+gross_total = rev.agg(spark_sum("gross_revenue")).first()[0]
+assert gross_total == nc_revenue, f"gold revenue mart: expected gross ${nc_revenue:,.2f}, got ${gross_total:,.2f}"
+bad_rows = rev.filter(col("gross_revenue") != col("net_revenue") + col("refunded_amount")).count()
+assert bad_rows == 0, f"gold revenue mart: {bad_rows} rows where gross_revenue != net + refunded"
+
+# item demand
+demand = spark.table("workspace.gold.fct_item_demand_by_hour")
+units_sold = demand.agg(spark_sum("units_sold")).first()[0]
+assert units_sold == nc_quantity, f"gold item demand: expected {nc_quantity} units sold, got {units_sold}"
+bad_hours = demand.filter((col("hour_of_day") < 0) | (col("hour_of_day") > 23)).count()
+assert bad_hours == 0, f"gold item demand: {bad_hours} rows with hour_of_day outside 0-23"
+
+# price ratio
+ratio = spark.table("workspace.gold.fct_price_ratio_by_tier")
+period_total = ratio.agg(spark_sum(col("pre_revenue") + col("post_revenue"))).first()[0]
+print(f"price_ratio: pre + post revenue ${period_total:,.2f} vs non-cancelled ${nc_revenue:,.2f} " 
+      f"(equal if every tier appears in both periods)")
+display(ratio)
+
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ### fct_orders
 # MAGIC - 5,000 rows; `order_id` unique.
 # MAGIC - `sum(order_total)` = $180,604.30 (matches silver; cancelled orders included).
@@ -820,7 +894,12 @@ for name in GOLD_TABLES:
 
 # COMMAND ----------
 
-# Schema Validation
+# schema validation
 gold_schemas = {"fct_orders": FCT_ORDERS_SCHEMA, "fct_revenue_by_restaurant_category_month": FCT_REVENUE_SCHEMA, "fct_item_demand_by_hour": FCT_ITEM_DEMAND_SCHEMA, "fct_price_ratio_by_tier": FCT_PRICE_RATIO_SCHEMA}
-for t, schema in dim_tables_schemas.items():
+for t, schema in gold_schemas.items():
     assertSchemaEqual(spark.table(f"workspace.gold.{t}").schema, schema)
+
+# fct_orders validation
+
+id_count = spark.table(f"workspace.gold.fct_orders").select("order_id").distinct().count()
+assert id_count == 5000, f"fct_orders: expected 5000 unique order_ids, got {id_count}"

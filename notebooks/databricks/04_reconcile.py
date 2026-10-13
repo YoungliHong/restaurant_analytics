@@ -243,6 +243,43 @@ for name in MARTS:
 
 # COMMAND ----------
 
+def reconcile_exact(gold_df: DataFrame, snowflake_df: DataFrame, key_cols: list) -> dict:
+    """
+    Compare a gold table to its Snowflake export on key_cols. Every non-key column is compared exactly, null-safe. Returns counts of rows only in gold, rows only in Snowflake, and matched rows where any non-key column differs.
+    """
+    # 1. Key uniqueness on BOTH sides (assert): distinct key_cols count == row count
+    for name, df in [("gold", gold_df), ("snowflake", snowflake_df)]:
+        total = df.count()
+        distinct_keys = df.select(*key_cols).distinct().count()
+        assert distinct_keys == total, f"{name}: {total - distinct_keys} duplicate {key_cols} rows."
+
+    # 2. gold_only / snowflake_only: left_anti joins, on=key_cols
+    only_gold = gold_df.join(snowflake_df, on=key_cols, how="left_anti").count()
+    only_snowflake = snowflake_df.join(gold_df, on=key_cols, how="left_anti").count()
+
+    # 3. Aliased inner join on ALL key columns
+    g = gold_df.alias("g")
+    s = snowflake_df.alias("s")
+    joined = g.join(s, on=key_cols, how="inner")
+
+    # 4. Build `differs` over every non-key column, filter, count
+    compare_cols = [c for c in gold_df.columns if c not in key_cols]
+
+    differs = None
+    for c in compare_cols:
+        cond = ~col(f"g.{c}").eqNullSafe(col(f"s.{c}"))
+        differs = cond if differs is None else (differs|cond)
+
+    value_mismatches = joined.filter(differs).count()
+    # 5. Return the dict
+    return {
+        "gold_only": only_gold,
+        "snowflake_only": only_snowflake,
+        "value_mismatches": value_mismatches}
+
+
+# COMMAND ----------
+
 def reconcile_dim_restaurants(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
     """
     Key: restaurant_id.
@@ -251,8 +288,8 @@ def reconcile_dim_restaurants(gold_df: DataFrame, snowflake_df: DataFrame) -> di
     Pass: gold_only = 0, snowflake_only = 0, value_mismatches = 0
     (expected 4 rows each side).
     """
-    # TODO: key-uniqueness check, anti-joins both ways, null-safe value compare.
-    return None
+    
+    return reconcile_exact(gold_df, snowflake_df, ["restaurant_id"])
 
 
 def reconcile_dim_menu_items(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
@@ -264,8 +301,7 @@ def reconcile_dim_menu_items(gold_df: DataFrame, snowflake_df: DataFrame) -> dic
     Pass: gold_only = 0, snowflake_only = 0, value_mismatches = 0
     (expected 38 rows each side).
     """
-    # TODO: key-uniqueness check, anti-joins both ways, null-safe value compare.
-    return None
+    return reconcile_exact(gold_df, snowflake_df, ["menu_item_id"])
 
 
 def reconcile_dim_customers(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
@@ -282,8 +318,7 @@ def reconcile_dim_customers(gold_df: DataFrame, snowflake_df: DataFrame) -> dict
     2 customers whose first order fell ON their signup date, which Snowflake
     flags false. Those two are the first place to look if the flag mismatches.)
     """
-    # TODO: key-uniqueness check, anti-joins both ways, null-safe value compare.
-    return None
+    return reconcile_exact(gold_df, snowflake_df, ["customer_id"])
 
 
 def reconcile_fct_orders(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
@@ -296,8 +331,7 @@ def reconcile_fct_orders(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | 
     Pass: gold_only = 0, snowflake_only = 0, value_mismatches = 0
     (expected 5,000 rows each side; sum(order_total) = 180,604.30 in Snowflake).
     """
-    # TODO: key-uniqueness check, anti-joins both ways, null-safe value compare.
-    return None
+    return reconcile_exact(gold_df, snowflake_df, ["order_id"])
 
 
 def reconcile_fct_revenue_by_restaurant_category_month(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
@@ -311,8 +345,7 @@ def reconcile_fct_revenue_by_restaurant_category_month(gold_df: DataFrame, snowf
     Pass: gold_only = 0, snowflake_only = 0, value_mismatches = 0
     (expected 288 rows each side).
     """
-    # TODO: key-uniqueness check, anti-joins both ways, null-safe value compare.
-    return None
+    return reconcile_exact(gold_df, snowflake_df, ["restaurant_id", "category", "month"])
 
 
 def reconcile_fct_item_demand_by_hour(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
@@ -324,8 +357,7 @@ def reconcile_fct_item_demand_by_hour(gold_df: DataFrame, snowflake_df: DataFram
     (expected 456 rows each side). If keys are missing in a whole-hour band,
     suspect a timezone shift in hour() before anything else.
     """
-    # TODO: key-uniqueness check, anti-joins both ways, null-safe value compare.
-    return None
+    return reconcile_exact(gold_df, snowflake_df, ["menu_item_id", "hour_of_day"])
 
 
 def reconcile_fct_price_ratio_by_tier(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
@@ -347,9 +379,7 @@ def reconcile_fct_price_ratio_by_tier(gold_df: DataFrame, snowflake_df: DataFram
     (expected 4 rows each side: guest, bronze, silver, gold — tier names,
     not medallion layers).
     """
-    # TODO: key-uniqueness check, anti-joins both ways, exact compare on the
-    # four exact columns + abs-diff <= 1e-9 on the two ratios.
-    return None
+    return reconcile_exact(gold_df, snowflake_df, ["loyalty_tier"])
 
 # COMMAND ----------
 

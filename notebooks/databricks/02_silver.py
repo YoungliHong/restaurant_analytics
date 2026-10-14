@@ -336,45 +336,36 @@ def clean_orders(bronze_df: DataFrame) -> DataFrame:
 
 def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
     """
-    Mirrors models/intermediate/int_orders_deduped.sql exactly.
+    Based on models/intermediate/int_orders_deduped.sql, extended for
+    multiple batches.
 
     Input: the OUTPUT of clean_orders (already lowercased/remapped/typed),
-    not bronze directly — dbt's int_orders_deduped refs stg_orders, which
+    not bronze directly. dbt's int_orders_deduped refs stg_orders, which
     is itself the cleaned layer, not the raw source.
 
-    Rule: row_number() over (partition by order_id order by
-    order_timestamp desc), keep rn = 1, drop the helper column.
+    Rule: row_number() over (partition by order_id order by _ingested_at
+    desc, order_timestamp desc), keep rn = 1, drop the helper column.
 
-    The ordering is arbitratry, not a meaningful tiebreak — per the 2b
-    pre-check and the README's own Design Decisions caveat, the ~0.4%
-    duplicate rows are byte-identical, so any deterministic pick is
-    correct. order_timestamp desc is just what dbt happens to use.
-
-    Expected result once implemented: exactly 5,000 rows (5,020 bronze
-    rows minus the 20 confirmed-identical duplicates), one row per
-    distinct order_id.
-
-    TODO (MERGE stage) — latest load wins. Input is now ALL of bronze,
-    every batch, and its output is the MERGE source, so it must hold exactly
-    one row per order_id (Delta enforces no primary key: a duplicate new key
-    is silently double-inserted; a duplicate existing key makes MERGE fail).
-    New ordering: _ingested_at desc, then order_timestamp desc.
-      - Across batches: the newer load's version of an order wins, so a
+    This departs deliberately from int_orders_deduped, which only ever saw
+    one batch:
+      - Across batches, the newer load's version of an order wins, so a
         batch-2 correction beats the batch-1 row.
-      - Within one batch: every row shares one _ingested_at (one
-        current_timestamp() per bronze load), so the first key ties and
-        order_timestamp desc — dbt's rule — decides.
-    Why batch-1 output can't change: batch 1 is one load, so _ingested_at
-    ties everywhere and the old rule applies unchanged; and its duplicates
-    are byte-identical (2b), so any pick is the same row. Document this as
-    a deliberate departure from int_orders_deduped's rule, which only ever
-    saw one batch.
+      - Within one batch, every row shares one _ingested_at, so
+        order_timestamp desc (dbt's rule) decides.
+    Batch 1's output is unchanged: one load means _ingested_at ties
+    everywhere, and its duplicates are byte-identical (2b).
+
+    The output is the MERGE source, so it must hold exactly one row per
+    order_id. Delta enforces no primary key: a duplicate new key is
+    silently double-inserted, and a duplicate existing key makes MERGE fail.
+
+    Expected: one row per distinct order_id in bronze (5,000 for batch 1).
+
     Known gap: two rows for the same order_id within ONE batch that differ
-    in value tie on both keys, and the pick is arbitrary. Nothing defines
-    which is correct (file row order isn't preserved); a real feed would
+    in value tie on both keys, and the pick is arbitrary. A real feed would
     need a source-side sequence number or updated_at to break the tie.
     """
-    window_spec = Window.partitionBy("order_id").orderBy(col("order_timestamp").desc())
+    window_spec = Window.partitionBy("order_id").orderBy(col("_ingested_at").desc(), col("order_timestamp").desc())
     return (
       cleaned_orders_df
       .withColumn("row_num", row_number().over(window_spec)) 
@@ -404,8 +395,13 @@ def dedup_order_items(cleaned_order_items_df: DataFrame) -> DataFrame:
     per order_item_id. Runs BEFORE price_order_items, so pricing and the
     join see one row per line item.
     """
-    # TODO: latest-load-wins dedup on order_item_id.
-    return cleaned_order_items_df
+    window_spec = Window.partitionBy("order_item_id").orderBy(col("_ingested_at").desc())
+    return (
+      cleaned_order_items_df
+      .withColumn("row_num", row_number().over(window_spec)) 
+      .filter(col("row_num") == 1) 
+      .drop("row_num")
+    )
 
 
 # COMMAND ----------
@@ -448,8 +444,6 @@ def price_order_items(cleaned_order_items_df: DataFrame, deduped_orders_df: Data
 
     line_item_revenue is cast to DECIMAL(12,2): scale 2 matches the cents in unit_price, so no rounding happens, and precision 12 leaves ample headroom for quantity × price at this dataset's scale. Under ANSI mode, an overflow would raise an error rather than silently produce null.
 
-    TODO (MERGE stage) — lineage: take _ingested_at AND _source_file from
-    the line-item row (cleaned_order_items_df), not from deduped_orders_df.
     With multiple batches, a line item's lineage is the load that delivered
     that line, which needn't be the load that delivered its order header
     (e.g. batch 2 corrects order 4845's header but re-sends no lines).
@@ -462,7 +456,8 @@ def price_order_items(cleaned_order_items_df: DataFrame, deduped_orders_df: Data
         col("quantity"),
         col("unit_price"),
         (col("quantity") * col("unit_price")).cast("decimal(12,2)").alias("line_item_revenue"),
-        deduped_orders_df["_ingested_at"]
+        cleaned_order_items_df["_ingested_at"],
+        cleaned_order_items_df["_source_file"]
     )
     
 

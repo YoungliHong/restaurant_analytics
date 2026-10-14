@@ -6,6 +6,12 @@
 # MAGIC %md
 # MAGIC # Silver layer: dedup, transaction-time pricing, dbt-exact typing
 # MAGIC
+# MAGIC **Incremental (MERGE stage):** bronze is now append-only. Every run
+# MAGIC re-reads all of bronze; orders / order_items are deduped latest-load-wins
+# MAGIC and MERGEd with a conditional update, so a rerun changes nothing; dims
+# MAGIC take bronze's latest snapshot and overwrite. Batch 1 alone must still
+# MAGIC reconcile 7/7 against Snowflake. See sections 1 and 6.
+# MAGIC
 # MAGIC Reads `workspace.bronze.*` (all-string, one row per source row) and
 # MAGIC reproduces the dbt staging + intermediate logic exactly — same target
 # MAGIC types, same null handling, same canonical value mappings, same dedup
@@ -31,14 +37,41 @@
 # COMMAND ----------
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, trim, nullif, lit, lower, when, row_number, sum as spark_sum
+from pyspark.sql.functions import col, trim, nullif, lit, lower, when, row_number, sum as spark_sum, max as spark_max
 from pyspark.sql.window import Window
+from delta.tables import DeltaTable
 
 spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.silver")
 
-bronze_restaurants = spark.table("workspace.bronze.restaurants")
-bronze_menu_items = spark.table("workspace.bronze.menu_items")
-bronze_customers = spark.table("workspace.bronze.customers")
+# "true" runs the batch-1-only pre-check (2b). 05_merge_test passes "false"
+# via `%run ./02_silver $batch1_checks="false"`, because after batch 2
+# bronze legitimately holds non-identical rows for corrected orders.
+dbutils.widgets.text("batch1_checks", "true")
+BATCH1_CHECKS = dbutils.widgets.get("batch1_checks").lower() == "true"
+
+
+def latest_snapshot(bronze_df: DataFrame) -> DataFrame:
+    """
+    Rows from the most recent load only (max _ingested_at).
+
+    The dims arrive as complete snapshots, so the newest snapshot is the
+    whole truth and older ones are history. Bronze is append-only now; without
+    this filter a second restaurants file would make every restaurant appear
+    twice in silver. On batch 1 alone (a single load) it keeps every row.
+    """
+    latest = bronze_df.agg(spark_max("_ingested_at")).first()[0]
+    return bronze_df.filter(col("_ingested_at") == latest)
+
+
+# Dims: latest snapshot only, then overwrite (section 6).
+bronze_restaurants = latest_snapshot(spark.table("workspace.bronze.restaurants"))
+bronze_menu_items = latest_snapshot(spark.table("workspace.bronze.menu_items"))
+bronze_customers = latest_snapshot(spark.table("workspace.bronze.customers"))
+
+# Facts: ALL of bronze, every run. Dedup (latest load wins) + conditional
+# MERGE make re-processing history correct and cheap at this size, with no
+# watermark to store or restore. Production alternative: only rows with
+# _ingested_at above a stored watermark, or Auto Loader foreachBatch MERGE.
 bronze_orders = spark.table("workspace.bronze.orders")
 bronze_order_items = spark.table("workspace.bronze.order_items")
 
@@ -83,17 +116,24 @@ except Exception as e:
 # MAGIC equal the count of distinct `order_id` — because two rows that differ
 # MAGIC in any column but share an `order_id` would inflate the first count
 # MAGIC without inflating the second.
+# MAGIC
+# MAGIC **Batch-1 only** (guarded by the `batch1_checks` widget): once batch 2
+# MAGIC corrects an order, bronze holds two *different* rows for that
+# MAGIC `order_id` by design, and this check would correctly print False.
 
 # COMMAND ----------
 
-non_lineage_cols = [c for c in bronze_orders.columns if c not in ("_ingested_at", "_source_file")]
+if BATCH1_CHECKS:
+    non_lineage_cols = [c for c in bronze_orders.columns if c not in ("_ingested_at", "_source_file")]
 
-distinct_full_rows = bronze_orders.select(*non_lineage_cols).distinct().count()
-distinct_order_ids = bronze_orders.select("order_id").distinct().count()
+    distinct_full_rows = bronze_orders.select(*non_lineage_cols).distinct().count()
+    distinct_order_ids = bronze_orders.select("order_id").distinct().count()
 
-print(f"distinct full rows (excl. lineage cols): {distinct_full_rows:,}")
-print(f"distinct order_id:                       {distinct_order_ids:,}")
-print("byte-identical duplicates confirmed:", distinct_full_rows == distinct_order_ids)
+    print(f"distinct full rows (excl. lineage cols): {distinct_full_rows:,}")
+    print(f"distinct order_id:                       {distinct_order_ids:,}")
+    print("byte-identical duplicates confirmed:", distinct_full_rows == distinct_order_ids)
+else:
+    print("batch1_checks = false: skipping the batch-1 byte-identical pre-check")
 
 # COMMAND ----------
 
@@ -233,7 +273,8 @@ def clean_order_items(bronze_df: DataFrame) -> DataFrame:
       col("menu_item_id").cast("int").alias("menu_item_id"),
       col("quantity").cast("int").alias("quantity"),
       col("unit_price").cast("decimal(10,2)").alias("unit_price"),
-      col("_ingested_at")
+      col("_ingested_at"),
+      col("_source_file")
     )
 
 
@@ -282,7 +323,8 @@ def clean_orders(bronze_df: DataFrame) -> DataFrame:
       .otherwise(pm)
       .alias("payment_method"),
       col("status").alias("status"),
-      col("_ingested_at")
+      col("_ingested_at"),
+      col("_source_file")
     )
 
 # COMMAND ----------
@@ -311,6 +353,26 @@ def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
     Expected result once implemented: exactly 5,000 rows (5,020 bronze
     rows minus the 20 confirmed-identical duplicates), one row per
     distinct order_id.
+
+    TODO (MERGE stage) — latest load wins. Input is now ALL of bronze,
+    every batch, and its output is the MERGE source, so it must hold exactly
+    one row per order_id (Delta enforces no primary key: a duplicate new key
+    is silently double-inserted; a duplicate existing key makes MERGE fail).
+    New ordering: _ingested_at desc, then order_timestamp desc.
+      - Across batches: the newer load's version of an order wins, so a
+        batch-2 correction beats the batch-1 row.
+      - Within one batch: every row shares one _ingested_at (one
+        current_timestamp() per bronze load), so the first key ties and
+        order_timestamp desc — dbt's rule — decides.
+    Why batch-1 output can't change: batch 1 is one load, so _ingested_at
+    ties everywhere and the old rule applies unchanged; and its duplicates
+    are byte-identical (2b), so any pick is the same row. Document this as
+    a deliberate departure from int_orders_deduped's rule, which only ever
+    saw one batch.
+    Known gap: two rows for the same order_id within ONE batch that differ
+    in value tie on both keys, and the pick is arbitrary. Nothing defines
+    which is correct (file row order isn't preserved); a real feed would
+    need a source-side sequence number or updated_at to break the tie.
     """
     window_spec = Window.partitionBy("order_id").orderBy(col("order_timestamp").desc())
     return (
@@ -319,6 +381,31 @@ def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
       .filter(col("row_num") == 1) 
       .drop("row_num")
     )
+
+
+def dedup_order_items(cleaned_order_items_df: DataFrame) -> DataFrame:
+    """
+    Latest load wins on order_item_id. NEW at the MERGE stage; no dbt
+    equivalent (stg_order_items tests order_item_id unique, and batch 1
+    satisfies that, so on batch 1 alone this removes nothing).
+
+    Why it's required now: bronze is append-only and silver re-reads all of
+    it, so a repeated order (batch 2 re-sends order 4998 with its line item
+    13081) leaves order_item_id 13081 in bronze twice. Two source rows
+    matching one target row makes MERGE fail; two new duplicate keys would
+    be double-inserted. The MERGE source must be unique on order_item_id.
+
+    Rule: row_number() over (partition by order_item_id order by
+    _ingested_at desc), keep rn = 1, drop the helper. Same within-batch
+    known gap as dedup_orders: same-batch rows for one key that differ in
+    value tie, and the pick is arbitrary.
+
+    Input: the output of clean_order_items. Output: same columns, one row
+    per order_item_id. Runs BEFORE price_order_items, so pricing and the
+    join see one row per line item.
+    """
+    # TODO: latest-load-wins dedup on order_item_id.
+    return cleaned_order_items_df
 
 
 # COMMAND ----------
@@ -360,6 +447,13 @@ def price_order_items(cleaned_order_items_df: DataFrame, deduped_orders_df: Data
     quantity, unit_price, line_item_revenue.
 
     line_item_revenue is cast to DECIMAL(12,2): scale 2 matches the cents in unit_price, so no rounding happens, and precision 12 leaves ample headroom for quantity × price at this dataset's scale. Under ANSI mode, an overflow would raise an error rather than silently produce null.
+
+    TODO (MERGE stage) — lineage: take _ingested_at AND _source_file from
+    the line-item row (cleaned_order_items_df), not from deduped_orders_df.
+    With multiple batches, a line item's lineage is the load that delivered
+    that line, which needn't be the load that delivered its order header
+    (e.g. batch 2 corrects order 4845's header but re-sends no lines).
+    Output columns become: ..., line_item_revenue, _ingested_at, _source_file.
     """
     return cleaned_order_items_df.join(deduped_orders_df, "order_id", how = "inner").select(
         col("order_item_id"),
@@ -375,11 +469,139 @@ def price_order_items(cleaned_order_items_df: DataFrame, deduped_orders_df: Data
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Write each result as a Delta table in workspace.silver
+# MAGIC ## 6. Write: dims overwrite, orders / order_items MERGE
 # MAGIC
-# MAGIC `overwrite` for now, same reasoning as bronze: there's no watermark
-# MAGIC concept yet, and building one is explicitly a MERGE-stage concern —
-# MAGIC not this notebook's.
+# MAGIC **Dims (restaurants, menu_items, customers) stay `overwrite`.** Each dim
+# MAGIC file is a complete snapshot, so the newest snapshot (filtered in setup)
+# MAGIC *is* the correct table; dbt treats them the same way (`dim_menu_items`
+# MAGIC is the *current* price, no history). MERGE would only earn its keep if
+# MAGIC dim files were partial (only changed customers) or if we wanted SCD2
+# MAGIC history — neither is in scope.
+# MAGIC
+# MAGIC **orders / order_items are MERGEd** on `order_id` / `order_item_id`.
+# MAGIC One code path: on the first run the target is created empty (from the
+# MAGIC source's schema), so the initial load is just a MERGE where every row is
+# MAGIC NOT MATCHED. Each merge goes through `run_merge`, which:
+# MAGIC 1. creates the empty target if it doesn't exist,
+# MAGIC 2. refuses a source with duplicate keys (a clear error here instead of
+# MAGIC    MERGE's multiple-match failure or a silent double insert),
+# MAGIC 3. records the table version before and after, and prints the
+# MAGIC    `operationMetrics` of exactly the commits this run made — or "no
+# MAGIC    commit" if the version didn't move. Whether a MERGE that changes
+# MAGIC    nothing writes a commit at all isn't documented; this reports either
+# MAGIC    case correctly, and 05's rerun step is where it gets observed.
+# MAGIC
+# MAGIC Change detection compares **cleaned** business columns, so a
+# MAGIC casing-only correction in bronze (batch 2's order 4905) is not a change.
+# MAGIC Lineage columns are excluded from the comparison but refreshed whenever
+# MAGIC a row is updated.
+
+# COMMAND ----------
+
+ORDERS_KEY = "order_id"
+ORDERS_BUSINESS_COLS = ["restaurant_id", "customer_id", "order_timestamp",
+                        "order_type", "payment_method", "status"]
+
+ORDER_ITEMS_KEY = "order_item_id"
+ORDER_ITEMS_BUSINESS_COLS = ["order_id", "menu_item_id", "quantity",
+                             "unit_price", "line_item_revenue"]
+
+LINEAGE_COLS = ["_ingested_at", "_source_file"]
+
+
+def table_version(table: str) -> int:
+    return spark.sql(f"DESCRIBE HISTORY {table} LIMIT 1").first()["version"]
+
+
+def run_merge(table: str, key: str, source_df: DataFrame, merge_fn) -> None:
+    """Create-if-missing, key-uniqueness guard, merge, and report what this run committed."""
+    if not spark.catalog.tableExists(table):
+        source_df.limit(0).write.format("delta").saveAsTable(table)
+        print(f"{table}: created empty target (initial load)")
+
+    total = source_df.count()
+    distinct_keys = source_df.select(key).distinct().count()
+    if distinct_keys != total:
+        raise ValueError(
+            f"{table}: MERGE source has {total - distinct_keys} duplicate {key}s — dedup must run first"
+        )
+
+    before = table_version(table)
+    merge_fn(source_df)
+    after = table_version(table)
+
+    if after == before:
+        print(f"{table}: no commit (version stays {before}); source rows {total:,}")
+        return
+    commits = (
+        spark.sql(f"DESCRIBE HISTORY {table}")
+        .filter((col("version") > before) & (col("version") <= after))
+        .orderBy("version")
+        .collect()
+    )
+    for c in commits:
+        m = c["operationMetrics"] or {}
+        print(
+            f"{table}: v{c['version']} {c['operation']} — "
+            f"source {m.get('numSourceRows', '-')}, "
+            f"inserted {m.get('numTargetRowsInserted', '-')}, "
+            f"updated {m.get('numTargetRowsUpdated', '-')}, "
+            f"deleted {m.get('numTargetRowsDeleted', '-')}"
+        )
+
+
+def merge_orders(source_df: DataFrame) -> None:
+    """
+    MERGE source_df into workspace.silver.orders. SCAFFOLD ONLY.
+
+    source_df: dedup_orders(clean_orders(all of bronze)) — one row per
+    order_id (run_merge has already checked that), columns order_id,
+    ORDERS_BUSINESS_COLS, then LINEAGE_COLS.
+
+    Must do:
+      - Match on target.order_id = source.order_id.
+      - WHEN MATCHED, and only if at least one of ORDERS_BUSINESS_COLS
+        differs NULL-SAFELY (customer_id is NULL for guest orders, so plain
+        != would treat NULL vs NULL as "unknown" and NULL vs 5 as "unknown"
+        too — use <=> / eqNullSafe and negate it): UPDATE every business
+        column AND both LINEAGE_COLS. Lineage is never part of the
+        comparison, so an unchanged re-delivery doesn't count as an update.
+      - WHEN NOT MATCHED: INSERT all columns.
+      - No delete clause: bronze is append-only, so an order missing from
+        the source can't mean "deleted upstream".
+
+    Expected: batch 1 on an empty target -> inserted 5,000, updated 0.
+    Batch 2 -> inserted 3 (5001-5003), updated 2 (4845, 4936). Any rerun
+    -> inserted 0, updated 0 (or no commit at all).
+
+    Either API works: DeltaTable.forName(spark, ...).alias("t").merge(
+    source_df.alias("s"), ...) or SQL MERGE INTO against a temp view.
+    """
+    # TODO: MERGE (match condition, change-detection condition, update/insert clauses).
+    print("merge_orders: TODO — stub, nothing merged")
+
+
+def merge_order_items(source_df: DataFrame) -> None:
+    """
+    MERGE source_df into workspace.silver.order_items. SCAFFOLD ONLY.
+
+    source_df: price_order_items(dedup_order_items(clean_order_items(all of
+    bronze)), silver_orders) — one row per order_item_id, columns
+    order_item_id, ORDER_ITEMS_BUSINESS_COLS, then LINEAGE_COLS (once
+    price_order_items carries the line item's own lineage — see its TODO).
+
+    Must do: same shape as merge_orders —
+      - Match on target.order_item_id = source.order_item_id.
+      - WHEN MATCHED and any ORDER_ITEMS_BUSINESS_COLS differs null-safely:
+        UPDATE business columns + LINEAGE_COLS.
+      - WHEN NOT MATCHED: INSERT all columns.
+      - No delete clause.
+
+    Expected: batch 1 -> inserted 13,088, updated 0. Batch 2 -> inserted 5
+    (13089-13093), updated 0 (13081 is an exact repeat). Rerun -> 0 / 0.
+    """
+    # TODO: MERGE (match condition, change-detection condition, update/insert clauses).
+    print("merge_order_items: TODO — stub, nothing merged")
 
 # COMMAND ----------
 
@@ -391,7 +613,7 @@ cleaned_orders = clean_orders(bronze_orders)
 cleaned_order_items = clean_order_items(bronze_order_items)
 
 silver_orders = dedup_orders(cleaned_orders)
-silver_order_items = price_order_items(cleaned_order_items, silver_orders)
+silver_order_items = price_order_items(dedup_order_items(cleaned_order_items), silver_orders)
 
 SILVER_TABLES = {
     "restaurants": silver_restaurants,
@@ -401,9 +623,13 @@ SILVER_TABLES = {
     "order_items": silver_order_items,
 }
 
-for name, df in SILVER_TABLES.items():
+for name in ["restaurants", "menu_items", "customers"]:
+    df = SILVER_TABLES[name]
     df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"workspace.silver.{name}")
-    print(f"wrote workspace.silver.{name}: {df.count():,} rows")
+    print(f"wrote workspace.silver.{name}: {df.count():,} rows (overwrite)")
+
+run_merge("workspace.silver.orders", ORDERS_KEY, silver_orders, merge_orders)
+run_merge("workspace.silver.order_items", ORDER_ITEMS_KEY, silver_order_items, merge_order_items)
 
 # COMMAND ----------
 
@@ -553,8 +779,9 @@ assert expected_guests == actual_guests, f"silver orders: expected {expected_gue
 
 """
 All silver tables: uniqueness on the primary key, and completeness against
-bronze (orders: distinct bronze order_ids; all others: bronze row count,
-since nothing is deduped or filtered there).
+bronze. orders and order_items: distinct bronze keys (latest-load-wins dedup
+collapses repeats across batches and removes nothing else). Dims: bronze
+row count, since nothing is deduped or filtered there.
 """
 primary_keys = {
     "restaurants":"restaurant_id",
@@ -567,9 +794,15 @@ for name, pk in primary_keys.items():
     silver = spark.table(f"workspace.silver.{name}")
     silver_n = silver.count()
     distinct_n = silver.select(pk).distinct().count()
-    bronze_n = spark.table(f"workspace.bronze.{name}").count()
+    bronze = spark.table(f"workspace.bronze.{name}")
+    if name == "order_items":
+        bronze_n = bronze.select(pk).distinct().count()
+        expected_label = f"distinct bronze {pk}s"
+    else:
+        bronze_n = bronze.count()
+        expected_label = "bronze rows"
     assert distinct_n == silver_n, f"silver {name}: {silver_n - distinct_n} duplicate {pk}s"
-    assert silver_n == bronze_n, f"silver {name}: expected {bronze_n} rows (=bronze), got {silver_n}"
+    assert silver_n == bronze_n, f"silver {name}: expected {bronze_n} rows (={expected_label}), got {silver_n}"
 
 """
 Customers
@@ -604,7 +837,7 @@ display(items.select("order_item_id", "quantity", "unit_price", "line_item_reven
 total = items.agg(spark_sum("line_item_revenue")).first()[0]
 print(f"Total line_item_revenue: ${total:,.2f}")
 
-for name in ["restaurants", "menu_items", "customers","order_items"]:
+for name in ["restaurants", "menu_items", "customers"]:
     bronze_n = spark.table(f"workspace.bronze.{name}").count()
     silver_n = spark.table(f"workspace.silver.{name}").count()
     assert silver_n == bronze_n, f"silver {name}: expected {bronze_n} rows (=bronze), got {silver_n}"

@@ -52,24 +52,61 @@
 # MAGIC
 # MAGIC Run this cell first, before uploading anything — the volume has to exist
 # MAGIC to upload into it. Upload the five CSVs from your local `raw_data/` folder
-# MAGIC (the same ones already loaded into Snowflake) to:
+# MAGIC (the same ones already loaded into Snowflake) into **one subfolder per
+# MAGIC table** — batch 1 is just the first file in each folder:
 # MAGIC
 # MAGIC ```
-# MAGIC /Volumes/workspace/bronze/raw_files/restaurants.csv
-# MAGIC /Volumes/workspace/bronze/raw_files/menu_items.csv
-# MAGIC /Volumes/workspace/bronze/raw_files/customers.csv
-# MAGIC /Volumes/workspace/bronze/raw_files/orders.csv
-# MAGIC /Volumes/workspace/bronze/raw_files/order_items.csv
+# MAGIC /Volumes/workspace/bronze/raw_files/restaurants/restaurants.csv
+# MAGIC /Volumes/workspace/bronze/raw_files/menu_items/menu_items.csv
+# MAGIC /Volumes/workspace/bronze/raw_files/customers/customers.csv
+# MAGIC /Volumes/workspace/bronze/raw_files/orders/orders.csv
+# MAGIC /Volumes/workspace/bronze/raw_files/order_items/order_items.csv
 # MAGIC ```
 # MAGIC
-# MAGIC (Catalog Explorer → `workspace` → `bronze` → `raw_files` → **Upload to
-# MAGIC this volume**, or drag-and-drop each file — same five filenames as
-# MAGIC `SOURCE_TABLES` below.)
+# MAGIC (Catalog Explorer → `workspace` → `bronze` → `raw_files` → create each
+# MAGIC folder → **Upload to this volume**.) Later batches land as new files in
+# MAGIC the same folder (e.g. `orders/orders_batch2.csv`). One folder per table
+# MAGIC is also the layout COPY INTO and Auto Loader expect, so moving to either
+# MAGIC later is a path change, not a restructure.
+# MAGIC
+# MAGIC Files left at the old flat paths (`raw_files/orders.csv`) are ignored —
+# MAGIC the load reads table subfolders only.
 
 # COMMAND ----------
 
 spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.bronze")
 spark.sql("CREATE VOLUME IF NOT EXISTS workspace.bronze.raw_files")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1b. One-time reset (off by default)
+# MAGIC
+# MAGIC Needed once, when switching bronze from overwrite to append. The old
+# MAGIC overwrite-built tables carry a hardcoded `_source_file` (`"orders.csv"`),
+# MAGIC which never equals a real `_metadata.file_path` — so the append below
+# MAGIC would treat batch 1 as unseen and load it a second time. Silver
+# MAGIC `orders` / `order_items` are dropped too: they were built by overwrite
+# MAGIC without `_source_file`, and MERGE needs a target whose schema matches
+# MAGIC its source. (Silver dims are rewritten with `overwriteSchema` every run,
+# MAGIC so they don't need it.)
+# MAGIC
+# MAGIC Set `RESET = True`, run this cell, set it back to `False`. Then run the
+# MAGIC rest of 01 → 02 → 03 → 04 on batch 1 alone: that must still reconcile
+# MAGIC 7/7 (the regression check for the MERGE conversion).
+
+# COMMAND ----------
+
+RESET = False
+
+if RESET:
+    for table in ["restaurants", "menu_items", "customers", "orders", "order_items"]:
+        spark.sql(f"DROP TABLE IF EXISTS workspace.bronze.{table}")
+    for table in ["orders", "order_items"]:
+        spark.sql(f"DROP TABLE IF EXISTS workspace.silver.{table}")
+    print("dropped all bronze tables and silver orders / order_items — set RESET back to False")
+else:
+    print("RESET is False: nothing dropped")
 
 # COMMAND ----------
 
@@ -89,47 +126,94 @@ spark.sql("CREATE VOLUME IF NOT EXISTS workspace.bronze.raw_files")
 # MAGIC this is what a later idempotent/incremental design (MERGE, in silver)
 # MAGIC would reason about ("what came from which run").
 # MAGIC
-# MAGIC **`overwrite` for now:** there's one batch of source data and no
-# MAGIC watermark concept yet. Building an appendable, idempotent load is
-# MAGIC explicitly a silver-layer (MERGE) concern — solving it here would mean
-# MAGIC solving a problem bronze doesn't have yet.
+# MAGIC **`append`, so bronze is a history of every load.** Each run appends
+# MAGIC only rows from files bronze hasn't seen yet. `_source_file` is the real
+# MAGIC `_metadata.file_path` of the file each row came from (not a hardcoded
+# MAGIC name), and `_ingested_at` is one `current_timestamp()` per load —
+# MAGIC Spark evaluates it once per query, so every row of a batch shares it.
+# MAGIC That shared value is what silver's latest-load-wins dedup sorts on.
+# MAGIC
+# MAGIC **Idempotency: skip any file whose path is already in bronze.** The
+# MAGIC "what's been loaded" state is the bronze table itself
+# MAGIC (`SELECT DISTINCT _source_file`): queryable, and rolled back by
+# MAGIC `RESTORE TABLE` along with the data. That's the deciding reason over
+# MAGIC COPY INTO, whose docs say it skips already-loaded files but not where
+# MAGIC that state lives or whether a RESTORE resets it — and the merge test
+# MAGIC (05) restores bronze, then must be able to reload batch 2 on its next
+# MAGIC run. Paths are compared only against other `_metadata.file_path` values,
+# MAGIC never against `dbutils.fs.ls` output, since the two needn't share a
+# MAGIC URI prefix.
+# MAGIC
+# MAGIC Shared limitation with COPY INTO: a corrected file re-uploaded under
+# MAGIC the *same* name is skipped. Corrections arrive as new files. At
+# MAGIC production scale, COPY INTO or Auto Loader (checkpointed file tracking,
+# MAGIC no scan of bronze per run) would replace the anti-join.
+# MAGIC
+# MAGIC If nothing is new, the write is skipped entirely — no empty append, so
+# MAGIC a rerun leaves every bronze table's version unchanged.
+# MAGIC
+# MAGIC Every file in a folder must share one header in the same column order:
+# MAGIC Spark reads a multi-file CSV positionally against the first header.
 
 # COMMAND ----------
 
-from pyspark.sql.functions import current_timestamp, lit
+from pyspark.sql.functions import col, current_timestamp
 
 SOURCE_TABLES = ["restaurants", "menu_items", "customers", "orders", "order_items"]
 VOLUME_PATH = "/Volumes/workspace/bronze/raw_files"
 
-for table in SOURCE_TABLES:
-    csv_path = f"{VOLUME_PATH}/{table}.csv"
 
-    df = (
+def read_table_folder(table: str):
+    """Every CSV in the table's folder, all-string, tagged with load metadata."""
+    return (
         spark.read
         .option("header", True)
         .option("inferSchema", False)  # every column lands as STRING — see note above
-        .csv(csv_path)
-        .withColumn("_ingested_at", current_timestamp())
-        .withColumn("_source_file", lit(f"{table}.csv"))
+        .option("pathGlobFilter", "*.csv")  # ignore .DS_Store and other stray files
+        .csv(f"{VOLUME_PATH}/{table}")
+        .select(
+            "*",
+            current_timestamp().alias("_ingested_at"),
+            col("_metadata.file_path").alias("_source_file"),
+        )
     )
 
-    (
-        df.write
-        .format("delta")
-        .mode("overwrite")
-        .saveAsTable(f"workspace.bronze.{table}")
-    )
-    print(f"wrote workspace.bronze.{table}: {df.count():,} rows")
+
+for table in SOURCE_TABLES:
+    target = f"workspace.bronze.{table}"
+    incoming = read_table_folder(table)
+
+    if spark.catalog.tableExists(target):
+        loaded = spark.table(target).select("_source_file").distinct()
+        # left_anti on a named key moves it to the front; reselect to keep column order
+        new_rows = incoming.join(loaded, "_source_file", "left_anti").select(*incoming.columns)
+    else:
+        new_rows = incoming
+
+    new_files = sorted(r["_source_file"] for r in new_rows.select("_source_file").distinct().collect())
+    if not new_files:
+        print(f"{target}: no new files, nothing appended")
+        continue
+
+    new_rows.write.format("delta").mode("append").saveAsTable(target)
+    print(f"{target}: appended {len(new_files)} new file(s)")
+    for path in new_files:
+        print(f"    {path}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 3. Verify: table list, row counts vs. source, one sample query
 # MAGIC
-# MAGIC Row counts compare the volume CSV (the thing actually loaded) against
-# MAGIC the Delta table. Bronze does no aggregation or dedup, so these should
-# MAGIC match exactly, including the ~0.4% duplicate `orders` rows the generator
-# MAGIC injects on purpose — dedup is silver's job, not bronze's.
+# MAGIC Row counts compare **each file** in the volume against the bronze rows
+# MAGIC tagged with that `_source_file`. Per file, not per table: with append,
+# MAGIC a table holds several files, and a per-table total can't tell a missing
+# MAGIC file from a double-loaded one. Both sides are keyed by
+# MAGIC `_metadata.file_path`, so paths compare like for like. Bronze does no
+# MAGIC aggregation or dedup, so every file should match exactly, including the
+# MAGIC ~0.4% duplicate `orders` rows the generator injects on purpose — dedup
+# MAGIC is silver's job, not bronze's. A file in the volume but not in bronze
+# MAGIC shows `bronze_rows = 0`.
 
 # COMMAND ----------
 
@@ -137,20 +221,31 @@ display(spark.sql("SHOW TABLES IN workspace.bronze"))
 
 # COMMAND ----------
 
-import pandas as pd
+from pyspark.sql.functions import coalesce, count, lit
 
-rows = []
+per_file = []
 for table in SOURCE_TABLES:
-    csv_count = len(pd.read_csv(f"{VOLUME_PATH}/{table}.csv"))
-    delta_count = spark.table(f"workspace.bronze.{table}").count()
-    rows.append({
-        "table": table,
-        "csv_row_count": csv_count,
-        "delta_row_count": delta_count,
-        "match": csv_count == delta_count,
-    })
+    file_counts = read_table_folder(table).groupBy("_source_file").agg(count("*").alias("csv_rows"))
+    bronze_counts = (
+        spark.table(f"workspace.bronze.{table}")
+        .groupBy("_source_file").agg(count("*").alias("bronze_rows"))
+    )
+    per_file.append(
+        file_counts.join(bronze_counts, "_source_file", "full_outer")
+        .select(
+            lit(table).alias("table"),
+            "_source_file",
+            coalesce(col("csv_rows"), lit(0)).alias("csv_rows"),
+            coalesce(col("bronze_rows"), lit(0)).alias("bronze_rows"),
+        )
+        .withColumn("match", col("csv_rows") == col("bronze_rows"))
+    )
 
-display(spark.createDataFrame(pd.DataFrame(rows)))
+file_report = per_file[0]
+for df in per_file[1:]:
+    file_report = file_report.unionByName(df)
+
+display(file_report.orderBy("table", "_source_file"))
 
 # COMMAND ----------
 

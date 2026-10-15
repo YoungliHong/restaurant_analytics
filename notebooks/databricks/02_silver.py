@@ -553,37 +553,32 @@ def merge_orders(source_df: DataFrame) -> None:
     order_id (run_merge has already checked that), columns order_id,
     ORDERS_BUSINESS_COLS, then LINEAGE_COLS.
 
-    Must do:
-      - Match on target.order_id = source.order_id.
-      - WHEN MATCHED, and only if at least one of ORDERS_BUSINESS_COLS
-        differs NULL-SAFELY (customer_id is NULL for guest orders, so plain
-        != would treat NULL vs NULL as "unknown" and NULL vs 5 as "unknown"
-        too — use <=> / eqNullSafe and negate it): UPDATE every business
-        column AND both LINEAGE_COLS. Lineage is never part of the
-        comparison, so an unchanged re-delivery doesn't count as an update.
-      - WHEN NOT MATCHED: INSERT all columns.
-      - No delete clause: bronze is append-only, so an order missing from
-        the source can't mean "deleted upstream".
-
     Expected: batch 1 on an empty target -> inserted 5,000, updated 0.
     Batch 2 -> inserted 3 (5001-5003), updated 2 (4845, 4936). Any rerun
     -> inserted 0, updated 0 (or no commit at all).
-
-    Either API works: DeltaTable.forName(spark, ...).alias("t").merge(
-    source_df.alias("s"), ...) or SQL MERGE INTO against a temp view.
     """
-    # TODO: MERGE (match condition, change-detection condition, update/insert clauses).
-    print("merge_orders: TODO — stub, nothing merged")
+    target = DeltaTable.forName(spark, "workspace.silver.orders").alias("t")
+    source = source_df.alias("s")
+
+    changed = None
+    for c in ORDERS_BUSINESS_COLS:
+        cond = ~col(f"t.{c}").eqNullSafe(col(f"s.{c}"))  
+        changed = cond if changed is None else (changed | cond)
+
+    (target
+     .merge(source, "s.order_id = t.order_id")
+     .whenMatchedUpdateAll(condition = changed)
+     .whenNotMatchedInsertAll()
+     .execute())     
 
 
 def merge_order_items(source_df: DataFrame) -> None:
     """
-    MERGE source_df into workspace.silver.order_items. SCAFFOLD ONLY.
+    MERGE source_df into workspace.silver.order_items. 
 
     source_df: price_order_items(dedup_order_items(clean_order_items(all of
     bronze)), silver_orders) — one row per order_item_id, columns
-    order_item_id, ORDER_ITEMS_BUSINESS_COLS, then LINEAGE_COLS (once
-    price_order_items carries the line item's own lineage — see its TODO).
+    order_item_id, ORDER_ITEMS_BUSINESS_COLS, then LINEAGE_COLS.
 
     Must do: same shape as merge_orders —
       - Match on target.order_item_id = source.order_item_id.
@@ -595,8 +590,19 @@ def merge_order_items(source_df: DataFrame) -> None:
     Expected: batch 1 -> inserted 13,088, updated 0. Batch 2 -> inserted 5
     (13089-13093), updated 0 (13081 is an exact repeat). Rerun -> 0 / 0.
     """
-    # TODO: MERGE (match condition, change-detection condition, update/insert clauses).
-    print("merge_order_items: TODO — stub, nothing merged")
+    target = DeltaTable.forName(spark, "workspace.silver.order_items").alias("t")
+    source = source_df.alias("s")
+
+    changed = None
+    for c in ORDER_ITEMS_BUSINESS_COLS:
+        cond = ~col(f"t.{c}").eqNullSafe(col(f"s.{c}"))
+        changed = cond if changed is None else (changed | cond)
+
+    (target
+     .merge(source, "s.order_item_id = t.order_item_id")
+     .whenMatchedUpdateAll(condition = changed)
+     .whenNotMatchedInsertAll()
+     .execute())
 
 # COMMAND ----------
 

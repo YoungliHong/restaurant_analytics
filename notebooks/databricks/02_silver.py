@@ -724,21 +724,17 @@ for table, cols in checks.items():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC %md
 # MAGIC ## 8. Silver checks: logic assertions
 # MAGIC
 # MAGIC Section 7's verification covers structure (row counts, schemas, and
 # MAGIC nulls introduced by casting). This section checks that the *logic* did
 # MAGIC what the dbt spec says, against known expected values:
 # MAGIC
-# MAGIC - **orders:** dedup left exactly one row per `order_id`; `order_type`,
-# MAGIC   `payment_method`, and `status` contain only their canonical values;
-# MAGIC   guest orders (null `customer_id`) were preserved, not dropped.
-# MAGIC - **customers:** no blank `email` or `phone` survived the trim-then-nullif
-# MAGIC   cleanup.
-# MAGIC - **order_items:** every line item has a `line_item_revenue`; one row is
-# MAGIC   spot-checked by hand, and the revenue total is printed for comparison
-# MAGIC   with the earlier PySpark notebook.
+# MAGIC - **orders:** one row per `order_id`; and exactly as many distinct bronze `order_ids` (dedupe removed duplicates and nothing else); `order_type`, `payment_type`, and `status` contain exactly their canonical values; guest orders (null `customer_id`) were preserved.
+# MAGIC - **all other tables:** unique on the primary key and ccomplete against bronze (order_items: distinct bronze keys; dims: bronze row count).
+# MAGIC - **customers:** no blank or untrimmed `email`/`phone` survived cleanup.
+# MAGIC - **order_items:** no null `line_item_revenue`, and `quantity x unit_price = line_item_revenue`on every row; total revenue printed for inspection.
+# MAGIC
 # MAGIC
 # MAGIC Fixed expectations are `assert`s, so a regression fails loudly on rerun.
 

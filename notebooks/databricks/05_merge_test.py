@@ -204,48 +204,148 @@ for t, m in BATCH2_MERGES.items():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Batch 2 expected outcome — SCAFFOLD ONLY
+# MAGIC ## 5. Batch 2 expected outcome
 
 # COMMAND ----------
 
+from decimal import Decimal
 def assert_batch2_outcome(before: dict, after: dict, merges: dict) -> None:
     """
-    Assert batch 2 did exactly what the fixture table in section 2 says.
-    SCAFFOLD ONLY. `before` / `after` are snapshot_state() dicts; `merges`
-    is BATCH2_MERGES (merge_totals per silver fact table).
+    Assert batch 2 did exactly what its fixtures predict.
 
-    Bronze (append, files never double-loaded):
-      - orders: rows +8 (5,020 -> 5,028); order_items: rows +6 (13,088 -> 13,094)
-      - restaurants / menu_items / customers: version AND rows unchanged
-        (no batch-2 dim files -> no write at all)
+    Each fixture row is a scenario with a predicted end state in silver. The
+    test doesn't watch rows move through bronze/dedup/MERGE — it runs 01 and
+    02, then checks where each one landed. The counts and MERGE metrics at
+    the end are the same story totaled up, so they must agree with it.
 
-    Silver MERGE metrics (merges[...]):
-      - orders: inserted 3, updated 2
-      - order_items: inserted 5, updated 0
-      - source_rows: 5,003 / 13,093 — the whole deduped bronze, not just
-        batch 2 (silver re-merges all of bronze each run)
+    Args: `before` / `after` are snapshot_state() dicts (table -> {"version",
+    "rows"}); `merges` is BATCH2_MERGES (table -> merge_totals() dict).
+    silver_order / silver_item return lists: check len == 1 before reading
+    fields — for every key below, more than one row means a double insert.
 
-    Silver row counts: orders 5,000 -> 5,003; order_items 13,088 -> 13,093.
+    1. Per-order scenarios (silver end state)
+      - 4845  real correction, completed -> refunded
+              status 'refunded'; _source_file ends '/orders/orders_batch2.csv'
+              (updated, lineage refreshed)
+      - 4936  real correction, completed -> cancelled
+              status 'cancelled'; _source_file ends '/orders/orders_batch2.csv'
+      - 4905  cosmetic-only (" Delivery " / "CARD"), identical once cleaned
+              order_type 'delivery'; payment_method 'card'; _source_file STILL
+              ends '/orders/orders.csv' (not updated -> lineage not refreshed;
+              if this points at batch 2, change detection is broken)
+      - 4998  exact repeat
+              _source_file still ends '/orders/orders.csv' (not updated)
+      - 5001  new order -> exactly one row (inserted)
+      - 5002  new guest order with dirty values
+              customer_id is None; order_type 'takeout'; payment_method
+              'mobile_pay' (inserted AND cleaned)
+      - 5003  new, sent twice byte-identically (retry)
+              exactly one row; payment_method 'gift_card' (dedup collapsed
+              the retry before MERGE)
 
-    Row checks (silver_order / silver_item return lists — check len == 1
-    first, which also proves the 5003 within-batch duplicate collapsed):
-      - 4845: status 'refunded'; _source_file ends with
-        '/orders/orders_batch2.csv'
-      - 4936: status 'cancelled'; _source_file ends with '/orders/orders_batch2.csv'
-      - 4905: order_type 'delivery', payment_method 'card', and _source_file
-        still ends with '/orders/orders.csv' (cosmetic-only -> not updated,
-        lineage NOT refreshed)
-      - 4998: _source_file still batch 1 (exact repeat -> not updated)
-      - 5002: customer_id is None; order_type 'takeout'; payment_method 'mobile_pay'
-      - 5003: exactly one row; payment_method 'gift_card'
-      - order_item 13081: _source_file still ends with
-        '/order_items/order_items.csv' (repeat -> not updated)
-      - order_items 13089-13093: one row each; 13090 line_item_revenue
-        == Decimal('10.80')
+    2. Per-line-item scenarios
+      - 13081        exact repeat -> _source_file still ends
+                     '/order_items/order_items.csv' (not updated)
+      - 13089-13093  new -> exactly one row each;
+                     13090 line_item_revenue == Decimal('10.80') (2 x 5.40)
+
+    3. Totals — must agree with sections 1-2
+      MERGE metrics (fixture facts, hardcoded):
+      - orders:      inserted 3 (5001-5003), updated 2 (4845, 4936)
+      - order_items: inserted 5 (13089-13093), updated 0
+      Silver rows (derived from `before`): orders +3, order_items +5
+      Bronze rows (derived from `before`): orders +8, order_items +6 —
+        every fixture line lands, repeats and the duplicate included,
+        since bronze appends and never dedups
+      Bronze dims (restaurants / menu_items / customers): version AND rows
+        unchanged — no batch-2 files for them, so no write at all
     """
-    # TODO: write the assertions.
-    print("assert_batch2_outcome: TODO — stub, nothing asserted")
+    rows = silver_order(4845)
+    assert len(rows) == 1, f"4845: expected 1 row, got {len(rows)}"
+    r = rows[0]
+    assert r["status"] == "refunded", f"4845: expected status 'refunded', got {r['status']}"
+    assert r["_source_file"].endswith('/orders/orders_batch2.csv'), \
+      f"4845: expected lineage from orders_batch2.csv, got {r['_source_file']}"
 
+    rows = silver_order(4936)
+    assert len(rows) == 1, f"4936: expected 1 row, got {len(rows)}"
+    r = rows[0]
+    assert r["status"] == "cancelled", f"4936: expected status 'cancelled', got {r['status']}"
+    assert r["_source_file"].endswith('/orders/orders_batch2.csv'), \
+      f"4936: expected lineage from orders_batch2.csv, got {r['_source_file']}"
+
+    rows = silver_order(4905)
+    assert len(rows) == 1, f"4905: expected 1 row, got {len(rows)}"
+    r = rows[0]
+    assert r["order_type"] == "delivery", f"4905: order_type not cleaned, got {r['order_type']!r}"
+    assert r["payment_method"] == "card", f"4905: payment_method not cleaned, got {r['payment_method']!r}"
+    assert r["_source_file"].endswith('/orders/orders.csv'), \
+      f"4905: cosmetic-only re-delivery was updated (change detection), lineage is {r['_source_file']}"
+
+    rows = silver_order(4998)
+    assert len(rows) == 1, f"4998: expected 1 row, got {len(rows)}"
+    r = rows[0]
+    assert r["_source_file"].endswith('/orders/orders.csv'), \
+      f"4998: exact repeat was updated (check change condition/lineage excluded), lineage is {r['_source_file']}."
+
+    rows = silver_order(5001)
+    assert len(rows) == 1, f"5001: expected 1 row, got {len(rows)}"
+
+    rows = silver_order(5002)
+    assert len(rows) == 1, f"5002: expected 1 row, got {len(rows)}"
+    r = rows[0]
+    assert r['customer_id'] is None, f"5002: expected null customer_id, got {r['customer_id']!r}"
+    assert r["order_type"] == "takeout", f"5002: order_type not cleaned, got {r['order_type']!r}"
+    assert r["payment_method"] == "mobile_pay", f"5002: payment_method not cleaned, got {r['payment_method']!r}"
+
+    rows = silver_order(5003)
+    assert len(rows) == 1, f"5003: expected 1 row, got {len(rows)} (within-batch retry not deduped before MERGE)"
+    r = rows[0]
+    assert r["payment_method"] == "gift_card", \
+       f"5003: payment_method not remapped, got {r['payment_method']!r}"
+
+    rows = silver_item(13081)
+    assert len(rows) == 1, f"13081: expected 1 row, got {len(rows)}"
+    r = rows[0]
+    assert r["_source_file"].endswith('/order_items/order_items.csv'), \
+      f"13081: exact repeat was updated (check change condition/lineage excluded), lineage is {r['_source_file']}"
+
+    for i in range (13089,13094):
+      rows = silver_item(i)
+      assert len(rows) == 1, f"{i}: expected 1 row, got {len(rows)}"
+ 
+    rows = silver_item(13090)
+    r = rows[0]
+    assert r["line_item_revenue"] == Decimal("10.80"), \
+      f"13090: expected revenue 10.80 (2 * 5.40), got {r['line_item_revenue']!r}"
+    
+    m = merges["workspace.silver.orders"]
+    assert m["inserted"] == 3, f"silver orders: expected 3 inserted (5001 - 5003), got {m['inserted']}"
+    assert m["updated"] == 2, f"silver orders: expected 2 updated (4845, 4936), got {m['updated']}"
+
+    m = merges["workspace.silver.order_items"]
+    assert m["inserted"] == 5, f"silver order items: expected 5 inserted (13089-13093), got {m['inserted']}"
+    assert m["updated"] == 0, f"silver order items: expected 0 updated, got {m['updated']}"
+
+    t = "workspace.silver.orders"
+    assert after[t]["rows"] == before[t]["rows"] + 3, \
+      f"{t}: expected {before[t]['rows'] + 3} rows (+3 new orders), got {after[t]['rows']}"
+
+    t = "workspace.silver.order_items"
+    assert after[t]["rows"] == before[t]["rows"] + 5, \
+      f"{t}: expected {before[t]['rows'] + 5} rows (+5 new order items), got {after[t]['rows']}"
+
+    t = "workspace.bronze.orders"
+    assert after[t]["rows"] == before[t]["rows"] + 8, \
+      f"{t}: expected {before[t]['rows'] + 8} rows (+8 new batch-2 lines), got {after[t]['rows']}"
+    
+    t = "workspace.bronze.order_items"
+    assert after[t]["rows"] == before[t]["rows"] + 6, \
+      f"{t}: expected {before[t]['rows'] + 6} rows (+6 new batch-2 lines), got {after[t]['rows']}"
+    
+    for t in ["workspace.bronze.restaurants", "workspace.bronze.menu_items", "workspace.bronze.customers"]:
+      assert before[t]["version"] == after[t]["version"], f"{t}: no batch-2 file, but version moved {before[t]['version']} -> {after[t]['version']}"
+      assert before[t]["rows"] == after[t]["rows"], f"{t}: no batch-2 file, but row count changed from {before[t]['rows']} -> {after[t]['rows']}"
 
 assert_batch2_outcome(STATE_BEFORE, STATE_AFTER_BATCH2, BATCH2_MERGES)
 
@@ -281,21 +381,46 @@ for t, m in RERUN_MERGES.items():
 # MAGIC
 # MAGIC Two behaviors the docs don't settle, observed in the output above:
 # MAGIC - Does a MERGE that changes nothing write a commit? (`committed`)
+# MAGIC   - **No-op MERGE commits:** yes. The rerun's MERGE wrote a new version (v2 -> v3) with 0 inserted/updated/deleted. 
+# MAGIC   
 # MAGIC - Does a matched row whose update condition is false count in
 # MAGIC   `numTargetRowsUpdated`? (`updated` should be 0 if not)
+# MAGIC   - **Condition-false matches count as updated:** no. Batch 2 matched ~5,000 rows but reported updated = 2, the two real corrections. numTargetRowsUpdated counts only rows actually rewritten.
 # MAGIC
 # MAGIC Record what you see in the README's Design Decisions when you write it up.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Rerun expected outcome — SCAFFOLD ONLY
+# MAGIC ## 8. Rerun expected outcome 
+
+# COMMAND ----------
+
+restores = {
+    "workspace.bronze.orders": 0, # was v1 after batch 2
+    "workspace.bronze.order_items": 0,
+    "workspace.silver.orders": 1, # was v2 after batch 2
+    "workspace.silver.order_items": 1,
+    "workspace.silver.restaurants": 9, # was v10
+    "workspace.silver.menu_items": 9, # was v9
+    "workspace.silver.customers": 6 # was v7
+}
+for t, v in restores.items():
+    spark.sql(f"RESTORE TABLE {t} TO VERSION AS OF {v}")
+for p in ["orders/orders_batch2.csv", "order_items/order_items_batch2.csv"]:
+    dbutils.fs.rm(f"/Volumes/workspace/bronze/raw_files/{p}")
+
+# COMMAND ----------
+
+for t in ["bronze.orders", "bronze.order_items", "silver.orders", "silver.order_items"]:
+    print(t, spark.table(f"workspace.{t}").count())
+print([f.name for f in dbutils.fs.ls("/Volumes/workspace/bronze/raw_files/orders/")])
 
 # COMMAND ----------
 
 def assert_rerun_is_noop(after_batch2: dict, after_rerun: dict, merges: dict) -> None:
     """
-    Assert the rerun changed nothing. SCAFFOLD ONLY. `merges` is RERUN_MERGES.
+    Assert the rerun changed nothing. `merges` is RERUN_MERGES.
 
     Bronze: for all five tables, version AND row count identical between
     after_batch2 and after_rerun (01 found no new files, so it didn't write).
@@ -308,9 +433,14 @@ def assert_rerun_is_noop(after_batch2: dict, after_rerun: dict, merges: dict) ->
     Silver dims are NOT part of this check: they overwrite every run, so
     their version moves by design even though their content doesn't.
     """
-    # TODO: write the assertions.
-    print("assert_rerun_is_noop: TODO — stub, nothing asserted")
+    for t in BRONZE:
+      assert after_rerun[t]["version"] == after_batch2[t]["version"], f"{t}: expected version {after_batch2[t]['version']} after rerun, got version {after_rerun[t]['version']}"
+      assert after_rerun[t]["rows"] == after_batch2[t]["rows"], f"{t}: expected {after_batch2[t]['rows']} rows after rerun, got {after_rerun[t]['rows']} rows"
 
+    for v in ["workspace.silver.orders", "workspace.silver.order_items"]:
+      assert after_rerun[v]["rows"] == after_batch2[v]["rows"], f"{v}: expected {after_batch2[v]['rows']} rows after rerun, got {after_rerun[v]['rows']} rows"
+      assert merges[v]["inserted"] == 0, f"{v}: Expected zero insertions after merge, got {merges[v]['inserted']}"
+      assert merges[v]["updated"] == 0, f"{v}: Expected zero rows updates, got {merges[v]['updated']}"
 
 assert_rerun_is_noop(STATE_AFTER_BATCH2, STATE_AFTER_RERUN, RERUN_MERGES)
 

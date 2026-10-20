@@ -396,28 +396,6 @@ for t, m in RERUN_MERGES.items():
 
 # COMMAND ----------
 
-restores = {
-    "workspace.bronze.orders": 0, # was v1 after batch 2
-    "workspace.bronze.order_items": 0,
-    "workspace.silver.orders": 1, # was v2 after batch 2
-    "workspace.silver.order_items": 1,
-    "workspace.silver.restaurants": 9, # was v10
-    "workspace.silver.menu_items": 9, # was v9
-    "workspace.silver.customers": 6 # was v7
-}
-for t, v in restores.items():
-    spark.sql(f"RESTORE TABLE {t} TO VERSION AS OF {v}")
-for p in ["orders/orders_batch2.csv", "order_items/order_items_batch2.csv"]:
-    dbutils.fs.rm(f"/Volumes/workspace/bronze/raw_files/{p}")
-
-# COMMAND ----------
-
-for t in ["bronze.orders", "bronze.order_items", "silver.orders", "silver.order_items"]:
-    print(t, spark.table(f"workspace.{t}").count())
-print([f.name for f in dbutils.fs.ls("/Volumes/workspace/bronze/raw_files/orders/")])
-
-# COMMAND ----------
-
 def assert_rerun_is_noop(after_batch2: dict, after_rerun: dict, merges: dict) -> None:
     """
     Assert the rerun changed nothing. `merges` is RERUN_MERGES.

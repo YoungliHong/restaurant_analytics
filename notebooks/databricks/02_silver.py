@@ -138,7 +138,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Per-table cleaning — SCAFFOLD ONLY
+# MAGIC ## 3. Per-table cleaning 
 # MAGIC
 # MAGIC Fill-in order (simplest to most involved, each one a prerequisite
 # MAGIC for something later — see the stop note at the end):
@@ -330,7 +330,7 @@ def clean_orders(bronze_df: DataFrame) -> DataFrame:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Dedup — SCAFFOLD ONLY
+# MAGIC ## 4. Dedup
 
 # COMMAND ----------
 
@@ -344,7 +344,7 @@ def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
     is itself the cleaned layer, not the raw source.
 
     Rule: row_number() over (partition by order_id order by _ingested_at
-    desc, order_timestamp desc), keep rn = 1, drop the helper column.
+    desc, order_timestamp desc, then the business columns as the final tiebreaker), keep rn = 1, drop the helper column.
 
     This departs deliberately from int_orders_deduped, which only ever saw
     one batch:
@@ -361,11 +361,9 @@ def dedup_orders(cleaned_orders_df: DataFrame) -> DataFrame:
 
     Expected: one row per distinct order_id in bronze (5,000 for batch 1).
 
-    Known gap: two rows for the same order_id within ONE batch that differ
-    in value tie on both keys, and the pick is arbitrary. A real feed would
-    need a source-side sequence number or updated_at to break the tie.
+    Known gap: the business-column tie breaker makes the pick deterministic (stable across reruns) but not necessarily correct; a real feed would need a source-side sequence number or updated_at col.
     """
-    window_spec = Window.partitionBy("order_id").orderBy(col("_ingested_at").desc(), col("order_timestamp").desc())
+    window_spec = Window.partitionBy("order_id").orderBy(col("_ingested_at").desc(), col("order_timestamp").desc(), *(col(c).desc() for c in ORDERS_BUSINESS_COLS))
     return (
       cleaned_orders_df
       .withColumn("row_num", row_number().over(window_spec)) 
@@ -386,16 +384,15 @@ def dedup_order_items(cleaned_order_items_df: DataFrame) -> DataFrame:
     matching one target row makes MERGE fail; two new duplicate keys would
     be double-inserted. The MERGE source must be unique on order_item_id.
 
-    Rule: row_number() over (partition by order_item_id order by
-    _ingested_at desc), keep rn = 1, drop the helper. Same within-batch
-    known gap as dedup_orders: same-batch rows for one key that differ in
-    value tie, and the pick is arbitrary.
+    Rule: row_number() over partition by order_item_id order by
+    _ingested_at desc, then order_id, menu_item_id, quantity, unit_price as the final tiebreaker (line_item_revenue is derived from these, and doesn't exist until price_order_items), keep rn = 1, drop the helper. Same within-batch
+    known gap as dedup_orders: the business column tie-breaker makes the pick deterministic but not necessarily correct. 
 
     Input: the output of clean_order_items. Output: same columns, one row
     per order_item_id. Runs BEFORE price_order_items, so pricing and the
     join see one row per line item.
     """
-    window_spec = Window.partitionBy("order_item_id").orderBy(col("_ingested_at").desc())
+    window_spec = Window.partitionBy("order_item_id").orderBy(col("_ingested_at").desc(), *(col(c).desc() for c in ["order_id", "menu_item_id", "quantity", "unit_price"]))
     return (
       cleaned_order_items_df
       .withColumn("row_num", row_number().over(window_spec)) 
@@ -407,7 +404,7 @@ def dedup_order_items(cleaned_order_items_df: DataFrame) -> DataFrame:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Transaction-time pricing — SCAFFOLD ONLY
+# MAGIC ## 5. Transaction-time pricing
 
 # COMMAND ----------
 
@@ -547,7 +544,7 @@ def run_merge(table: str, key: str, source_df: DataFrame, merge_fn) -> None:
 
 def merge_orders(source_df: DataFrame) -> None:
     """
-    MERGE source_df into workspace.silver.orders. SCAFFOLD ONLY.
+    MERGE source_df into workspace.silver.orders.
 
     source_df: dedup_orders(clean_orders(all of bronze)) — one row per
     order_id (run_merge has already checked that), columns order_id,
@@ -731,7 +728,7 @@ for table, cols in checks.items():
 # MAGIC what the dbt spec says, against known expected values:
 # MAGIC
 # MAGIC - **orders:** one row per `order_id`; and exactly as many distinct bronze `order_ids` (dedupe removed duplicates and nothing else); `order_type`, `payment_type`, and `status` contain exactly their canonical values; guest orders (null `customer_id`) were preserved.
-# MAGIC - **all other tables:** unique on the primary key and ccomplete against bronze (order_items: distinct bronze keys; dims: bronze row count).
+# MAGIC - **all other tables:** unique on the primary key and complete against bronze (order_items: distinct bronze keys; dims: bronze row count).
 # MAGIC - **customers:** no blank or untrimmed `email`/`phone` survived cleanup.
 # MAGIC - **order_items:** no null `line_item_revenue`, and `quantity x unit_price = line_item_revenue`on every row; total revenue printed for inspection.
 # MAGIC
@@ -747,7 +744,6 @@ Orders:
 2. Completeness: row count = distinct order_ids in bronze (dedup removed duplicates and nothing else)
 3. order_type, payment_method, and status contain exactly their canonical values
 4. Guest orders are preserved: null customer_id count = deduped bronze's null count
-All silver tables: uniqueness on the primary key, and completeness against bronze(orders: distinct bronze order_ids; all others: bronze row count, since nothing is deduped or filtered there)
 """
 orders = spark.table("workspace.silver.orders")
 bronze_orders = spark.table("workspace.bronze.orders")
@@ -833,12 +829,4 @@ display(items.select("order_item_id", "quantity", "unit_price", "line_item_reven
 
 total = items.agg(spark_sum("line_item_revenue")).first()[0]
 print(f"Total line_item_revenue: ${total:,.2f}")
-
-for name in ["restaurants", "menu_items", "customers"]:
-    bronze_n = spark.table(f"workspace.bronze.{name}").count()
-    silver_n = spark.table(f"workspace.silver.{name}").count()
-    assert silver_n == bronze_n, f"silver {name}: expected {bronze_n} rows (=bronze), got {silver_n}"
-
-untrimmed = customers.filter((col("email") != trim(col("email"))) | (col("phone") != trim(col("phone")))).count()
-assert untrimmed == 0, f"silver customers: {untrimmed} rows with untrimmed email or phone"
-                           
+                

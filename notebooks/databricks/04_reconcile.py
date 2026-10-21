@@ -458,3 +458,6 @@ for name, message in errors.items():
 results = [row[-1] for row in rows]
 print(f"\n{results.count('PASS')}/{len(results)} marts PASS"
       + (f", {results.count('TODO')} TODO" if "TODO" in results else ""))
+
+failed = [f"{row[0]}: {row[-1]}" for row in rows if row[-1] != "PASS"]
+assert not failed, f"reconcile gate: {len(failed)} mart(s) did not pass: {failed}"

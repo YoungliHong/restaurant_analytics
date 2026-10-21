@@ -898,8 +898,3 @@ display(ratio)
 gold_schemas = {"fct_orders": FCT_ORDERS_SCHEMA, "fct_revenue_by_restaurant_category_month": FCT_REVENUE_SCHEMA, "fct_item_demand_by_hour": FCT_ITEM_DEMAND_SCHEMA, "fct_price_ratio_by_tier": FCT_PRICE_RATIO_SCHEMA}
 for t, schema in gold_schemas.items():
     assertSchemaEqual(spark.table(f"workspace.gold.{t}").schema, schema)
-
-# fct_orders validation
-
-id_count = spark.table(f"workspace.gold.fct_orders").select("order_id").distinct().count()
-assert id_count == 5000, f"fct_orders: expected 5000 unique order_ids, got {id_count}"

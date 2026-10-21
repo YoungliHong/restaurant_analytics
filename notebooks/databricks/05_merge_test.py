@@ -27,12 +27,7 @@
 # MAGIC functions (sections 5 and 8) are docstring + TODO stubs.
 # MAGIC
 # MAGIC **Known gap (documented, not tested):** two rows for the same key
-# MAGIC *within one batch* that differ in value tie on both dedup keys
-# MAGIC (`_ingested_at`, then `order_timestamp`), so which one wins is
-# MAGIC arbitrary. Batch 2's within-batch duplicate (order 5003) is
-# MAGIC byte-identical — a retry — so its outcome is deterministic. Resolving a
-# MAGIC different-valued within-batch duplicate needs a source-side sequence
-# MAGIC number or `updated_at`, which this feed doesn't have.
+# MAGIC *within one batch* that differ in value tie on the load-order keys (`_ingested_at`, then `order_timestamp`). A final tiebreaker on the business columns makes the pick deterministic, so the rerun stays no-ops, but not necessarily correct: nothing in the feed says which version is newer. Batch 2's within-batch duplicate (order 5003) is byte-identical (a retry), so either pick give the same row. Correct resolution needs a source-side sequence number or `updated_at`; the production alternative is to fail or quarantine on conflicting duplicates.
 
 # COMMAND ----------
 
@@ -188,6 +183,8 @@ for path, content in BATCH2_FILES.items():
 # COMMAND ----------
 
 # MAGIC %run ./02_silver $batch1_checks="false"
+# MAGIC
+# MAGIC assert BATCH1_CHECKS is False, "batch1_checks argument to %run was ignored; 02 ran the batch-1 pre-check"
 
 # COMMAND ----------
 
@@ -361,6 +358,8 @@ assert_batch2_outcome(STATE_BEFORE, STATE_AFTER_BATCH2, BATCH2_MERGES)
 # COMMAND ----------
 
 # MAGIC %run ./02_silver $batch1_checks="false"
+# MAGIC
+# MAGIC assert BATCH1_CHECKS is False, "batch1_checks argument to %run was ignored; 02 ran the batch-1 pre-check"
 
 # COMMAND ----------
 
@@ -381,7 +380,7 @@ for t, m in RERUN_MERGES.items():
 # MAGIC
 # MAGIC Two behaviors the docs don't settle, observed in the output above:
 # MAGIC - Does a MERGE that changes nothing write a commit? (`committed`)
-# MAGIC   - **No-op MERGE commits:** yes. The rerun's MERGE wrote a new version (v2 -> v3) with 0 inserted/updated/deleted. 
+# MAGIC   - **No-op MERGE commits:** yes. The rerun's MERGE wrote a new version with 0 inserted/updated/deleted. 
 # MAGIC   
 # MAGIC - Does a matched row whose update condition is false count in
 # MAGIC   `numTargetRowsUpdated`? (`updated` should be 0 if not)

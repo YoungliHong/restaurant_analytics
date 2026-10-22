@@ -2,9 +2,11 @@
 
 ## Overview
 
-A dbt + Snowflake + PySpark pipeline built on synthetic restaurant POS data, modeling transaction-time pricing, dedup, and staging cleanup the way a real operational system would.
+A dbt + Snowflake pipeline built on synthetic restaurant POS data, modeling transaction-time pricing, deduplication, and staging cleanup.
 
-Built to demonstrate production-grade pipeline design outside a vendor/staffing environment.
+A second implementation on Databricks rebuilds the same seven marts as a bronze/silver/gold Delta pipeline, loads new batches incrementally with Delta MERGE, and is reconciled row for row against the Snowflake marts. See [Databricks medallion extension](#databricks-medallion-extension).
+
+Built to practice pipeline design patterns end to end: idempotent incremental loads, cross-engine reconciliation, and tests that prove each behavior.
 
 ## Architecture
 

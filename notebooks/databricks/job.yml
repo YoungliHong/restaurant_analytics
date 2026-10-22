@@ -1,0 +1,46 @@
+resources:
+  jobs:
+    restaurant_analytics_medallion:
+      name: restaurant_analytics_medallion
+      description: "Medallion pipeline: bronze append -> silver MERGE -> gold marts ->
+        reconcile gate vs Snowflake. Git sourced from databricks-delta"
+      tasks:
+        - task_key: bronze
+          notebook_task:
+            notebook_path: notebooks/databricks/01_bronze
+            source: GIT
+          environment_key: Default
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          notebook_task:
+            notebook_path: notebooks/databricks/02_silver
+            base_parameters:
+              batch1_checks: "false"
+            source: GIT
+          environment_key: Default
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: notebooks/databricks/03_gold
+            source: GIT
+          environment_key: Default
+        - task_key: reconcile
+          depends_on:
+            - task_key: gold
+          notebook_task:
+            notebook_path: notebooks/databricks/04_reconcile
+            source: GIT
+          environment_key: Default
+      git_source:
+        git_url: https://github.com/YoungliHong/restaurant_analytics
+        git_provider: gitHub
+        git_branch: databricks-delta
+      queue:
+        enabled: true
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: "6"
+      performance_target: PERFORMANCE_OPTIMIZED

@@ -184,7 +184,11 @@ for path, content in BATCH2_FILES.items():
 
 # MAGIC %run ./02_silver $batch1_checks="false"
 # MAGIC
-# MAGIC assert BATCH1_CHECKS is False, "batch1_checks argument to %run was ignored; 02 ran the batch-1 pre-check"
+
+# COMMAND ----------
+
+
+assert BATCH1_CHECKS is False, "batch1_checks argument to %run was ignored; 02 ran the batch-1 pre-check"
 
 # COMMAND ----------
 
@@ -359,7 +363,10 @@ assert_batch2_outcome(STATE_BEFORE, STATE_AFTER_BATCH2, BATCH2_MERGES)
 
 # MAGIC %run ./02_silver $batch1_checks="false"
 # MAGIC
-# MAGIC assert BATCH1_CHECKS is False, "batch1_checks argument to %run was ignored; 02 ran the batch-1 pre-check"
+
+# COMMAND ----------
+
+assert BATCH1_CHECKS is False, "batch1_checks argument to %run was ignored; 02 ran the batch-1 pre-check"
 
 # COMMAND ----------
 
@@ -385,6 +392,8 @@ for t, m in RERUN_MERGES.items():
 # MAGIC - Does a matched row whose update condition is false count in
 # MAGIC   `numTargetRowsUpdated`? (`updated` should be 0 if not)
 # MAGIC   - **Condition-false matches count as updated:** no. Batch 2 matched ~5,000 rows but reported updated = 2, the two real corrections. numTargetRowsUpdated counts only rows actually rewritten.
+# MAGIC
+# MAGIC %run arguments on serverless: %run ./02_silver $batch1_checks="false" does set 02’s widget. Asserted after each call (sections 4 and 6).
 # MAGIC
 # MAGIC Record what you see in the README's Design Decisions when you write it up.
 

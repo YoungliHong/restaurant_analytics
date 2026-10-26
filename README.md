@@ -6,7 +6,7 @@ A dbt + Snowflake pipeline built on synthetic restaurant POS data, modeling tran
 
 A second implementation on Databricks rebuilds the same seven marts as a bronze/silver/gold Delta pipeline, loads new batches incrementally with Delta MERGE, and is reconciled row for row against the Snowflake marts. See [Databricks medallion extension](#databricks-medallion-extension).
 
-Built to practice pipeline design patterns end to end: idempotent incremental loads, cross-engine reconciliation, and tests that prove each behavior.
+Built to practice pipeline design patterns end to end: idempotent incremental loads, cross-engine reconciliation, and tests for each behavior.
 
 ## Architecture
 
@@ -323,12 +323,27 @@ For this dataset, the price ratio agrees with the price increase of around ~1.08
 
 
 
-## Spark / Databricks Layer
+## Databricks Medallion Extension
+The seven dbt marts, rebuilt as a bronze/silver/gold Delta pipeline on Databricks Free Edition (serverless, Unity Catalog) with incremental loading added. It reads the same CSVs that were loaded into Snowflake. Every mart has a dbt counterpart, and on that batch-1 data gold must reproduce the dbt output exactly. Code is in `notebooks/databricks/`.
 
-`int_order_items_priced` was ported to PySpark and run on Databricks Free Edition (serverless), not out of a data-driven necessity, but to validate the transform in a distributed compute context and to get hands-on experience with distributed computing systems outside of Cosmos/SCOPE (Microsoft's internal big data framework). While the two share the same underlying distributed computing principles, Cosmos and SCOPE are optimized for ultra large batch workloads. The output matched the dbt/Snowflake version exactly ($180,604.30).
+| Layer | Notebook | What it does | dbt counterpart | Write |
+|---|---|---|---|---|
+| Bronze | `01_bronze` | Lands each source file as-is (all strings), tagged with `_ingested_at` and `_source_file`; skips files already loaded | sources (`RAW_DATA`) | append |
+| Silver | `02_silver` | Casts and cleans like dbt staging, dedups (latest load wins), prices line items at transaction-time `unit_price` | staging + intermediate | MERGE (orders, line items); overwrite (dims) |
+| Gold | `03_gold` | Builds the seven marts from silver | marts | overwrite |
+| Reconcile | `04_reconcile` | Compares each gold mart to its Snowflake export by key; fails the run unless all seven match | — | read-only |
 
-Spark earns its keep when the data volume exceeds single-node or warehouse-scale efficiency (multi-TB, hundreds of millions+ rows), transformations that don't map cleanly to SQL (custom Python/Scala logic), or for streaming/real-time event processing pipelines. For this project, a single warehouse satisfies both memory and computation needs so it remains the correct option.
+Dimension files are complete snapshots, so silver keeps only the newest one and overwrites; a MERGE would add nothing there. A Databricks Job runs the four notebooks in order, Git-sourced, on serverless compute, triggered manually.
 
+**Testing** 
+- **Batch-1 regression:** the full pipeline on the original data reconciles 7/7 against Snowflake.
+- **Batch-2** (`05_merge_test`)**:** a small hand-made batch where each row targets one behavior: real corrections, a cosmetic-only re-delivery, an exact repeat, new orders (including a guest order with dirty values), and a duplicate within a batch. Every row's expected outcome is asserted.
+- **Rerun:** loading batch 2 again is a no-op: bronze doesn't grow, and the MERGE inserts 0 and updates 0.
+- **Restore:** tables are rolled back to their pre-batch-2 Delta versions, gold is rebuilt, and reconcile is still 7/7.
+
+Spark earns its keep when the data volume exceeds single-node or warehouse-scale efficiency (multi-TB, hundreds of millions+ rows), for transformations that don't map cleanly to SQL (custom Python/Scala logic), or for streaming/real-time event processing. For this project's data, a single warehouse covers both memory and compute needs, so dbt + Snowflake remains the right primary choice; the Databricks build exists to practice the medallion and incremental patterns, not because the data requires it.
+
+Step-by-step flow, reconciliation details, design decisions, and known gaps: [docs/databricks.md](docs/databricks.md)
 
 ## Testing
 
@@ -338,7 +353,8 @@ Testing is done against the outputs at each stage of the pipeline:
 
 **Intermediate** (`models/intermediate/_int_models.yml`) - `unique` + `not_null` on `order_id` in `int_orders_deduped`, asserting the dedup logic actually produced one row per order. `int_order_items_priced.order_id` is tested with `relationships` against `int_orders_deduped`, confirming every line item resolves to a real, deduplicated order.
 
-**Marts** (`models/marts/_marts.yml`) - `relationships` tests linking facts to their dimensions (e.g. `fct_revenue_by_restaurant_category_month.restaurant_id` -> `dim_restaurants.restaurant_id`), catching any join that would silently drop or orphan rows. 
+**Marts** (`models/marts/_marts.yml`) - `unique` + `not null` on every dimension key and on `fct_orders.order_id`; `dbt_utils.unique_combination_of_columns` on the revenue and item-demand marts' grain; and a `relationships` test catching any `fct_orders` row whose `restaurant_id` has no matching `dim_restaurants` row. A singular test (`tests/gross_equals_net_plus_refunded.sql`) checks that gross revenue = net revenue + refunded.
+
 
 Run all tests:
 ```bash
@@ -350,6 +366,7 @@ Run tests for a single model:
 dbt test --select stg_orders
 ```
 
+The Databricks pipeline has its own tests (batch-1 regression, incremental merge scenarios, rerun idempotency, restore + reconcile); see [Databricks Medallion Extension](#databricks-medallion-extension).
 
 ## Future Work
 - **Phase 7 (real POS data)** - swapping in a real extract from family restaurant's POS system, mapped onto the existing staging layer. Deliberately scoped tight: one or two genuine insights, not a second project.

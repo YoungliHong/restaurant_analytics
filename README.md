@@ -353,7 +353,7 @@ Testing is done against the outputs at each stage of the pipeline:
 
 **Intermediate** (`models/intermediate/_int_models.yml`) - `unique` + `not_null` on `order_id` in `int_orders_deduped`, asserting the dedup logic actually produced one row per order. `int_order_items_priced.order_id` is tested with `relationships` against `int_orders_deduped`, confirming every line item resolves to a real, deduplicated order.
 
-**Marts** (`models/marts/_marts.yml`) - `unique` + `not null` on every dimension key and on `fct_orders.order_id`; `dbt_utils.unique_combination_of_columns` on the revenue and item-demand marts' grain; and a `relationships` test catching any `fct_orders` row whose `restaurant_id` has no matching `dim_restaurants` row. A singular test (`tests/gross_equals_net_plus_refunded.sql`) checks that gross revenue = net revenue + refunded.
+**Marts** (`models/marts/_marts.yml`) - `unique` + `not_null` on every dimension key and on `fct_orders.order_id`; `dbt_utils.unique_combination_of_columns` on the revenue and item-demand marts' grain; and a `relationships` test catching any `fct_orders` row whose `restaurant_id` has no matching `dim_restaurants` row. A singular test (`tests/gross_equals_net_plus_refunded.sql`) checks that gross revenue = net revenue + refunded.
 
 
 Run all tests:

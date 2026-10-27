@@ -89,3 +89,40 @@ The gold table's schema is also checked against its contract: names, order, and 
 `05_merge_test` is not part of the Job. It writes test files and restores tables, so it runs on demand.
 
 Because the Snowflake exports are a fixed batch-1 snapshot, the Job works as a regression check on batch-1 data. A run after a new batch has landed in bronze would fail the gate by design, since Snowflake doesn't have that batch.
+
+## Design decisions
+
+### Skipping already-loaded files by path, not COPY INTO
+
+Bronze decides what's new by comparing each file's path against the `_source_file` values already in the table. COPY INTO would also skip files it has already loaded, but its documentation (checked October 2026) doesn't say where it keeps that record or whether `RESTORE TABLE` resets it. That mattered here: the merge test restores bronze to its pre-test version and must be able to load the same test files again on its next run. With path-based skipping, the record of what's loaded *is* the table's data, so restoring the table restores the record too, and it can be inspected with a plain query (`SELECT DISTINCT _source_file`).
+
+The trade-offs:
+- Every run reads every file in the folder before filtering, so the cost grows with the number of files.
+- A file re-uploaded under the same name is skipped, which COPY INTO also does; corrections have to arrive as new files.
+
+At larger scale, COPY INTO or Auto Loader, which tracks the files it has seen in its own checkpoint, would replace the anti-join without scanning bronze on every run.
+
+### Re-merging all of bronze instead of a watermark
+
+Silver reads every bronze row on every run rather than only rows from new files. Nothing has to be stored between runs, so there's no watermark to advance, lose, or roll back. After a restore or a run that failed halfway, the next run simply converges again. Deduplication also sees every version of every key, so latest-load-wins is decided over the full history rather than one batch at a time.
+
+The cost is a full read of bronze every run, which is trivial at this data size; the conditional MERGE keeps the writes proportional to what actually changed. The usual alternative at scale is to process only rows above a stored `_ingested_at` watermark, or to have Auto Loader hand each new micro-batch to a MERGE (`foreachBatch`).
+
+### Latest load wins, with a fixed tiebreak
+
+dbt's `int_orders_deduped` keeps one row per order by `order_timestamp`, which was enough when there was only ever one batch. With several batches, the newer delivery of an order should win, so silver sorts by `_ingested_at` first, then dbt's `order_timestamp`, then the business columns.
+
+- **Batch-1 output can't change:** batch 1 is a single load, so every row shares one `_ingested_at` and dbt's rule decides, and batch 1's duplicates are byte-identical anyway.
+- **The final tiebreak exists for reruns, not correctness:** without it, two different rows tied on both timestamps could be picked in a different order on each run, so a rerun could flip which one wins and report an update. With it, the pick is the same every time. Whether it's the *right* pick is a known gap (see Known gaps).
+
+### Lineage columns are not part of change detection
+
+The MERGE updates a matched row only when one of its business columns differs. `_ingested_at` and `_source_file` are left out of that comparison, so a file that re-delivers an unchanged order doesn't count as a change. When a row *is* updated, its lineage columns are refreshed along with it.
+
+As a result, a row's `_source_file` names the load that last *changed* it, not the last load that delivered it. Tracking the last delivery instead (for example, to spot orders that stopped arriving) would need a separate `_last_seen_at` column. In batch 2, order 4905 arrives with only cosmetic differences (`" Delivery "`, `CARD`), which are identical after cleaning, so it keeps its batch-1 lineage; the merge test asserts exactly that.
+
+### What MERGE does on a no-op rerun
+
+Two behaviors the Delta documentation doesn't spell out, observed on Databricks Free Edition serverless, October 2026:
+- **A MERGE that changes nothing still writes a commit**, with 0 rows inserted, updated, and deleted. So a silver table's version moving is not evidence that anything changed. The merge test therefore reads the operation metrics of exactly the commits made since a recorded version, rather than the latest history entry. (Bronze is different: when no file is new it skips the write entirely, so its version really doesn't move.)
+- **Rows that match but fail the update condition aren't counted as updated.** In batch 2 the MERGE matched all 5,000 existing orders and reported 2 updated, the two real corrections. On the rerun it matched 5,003 and reported 0.

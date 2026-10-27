@@ -10,8 +10,8 @@
 # MAGIC pipeline exactly: for each of the seven marts, every key present on one
 # MAGIC side is present on the other, and every value on a matching key agrees.
 # MAGIC
-# MAGIC **How the Snowflake side gets here:** Free Edition can't connect out to
-# MAGIC this Snowflake account, so `scripts/export_marts.py` dumps
+# MAGIC **How the Snowflake side gets here:** the marts are exported rather than
+# MAGIC queried live. `scripts/export_marts.py` dumps
 # MAGIC `ANALYTICS.MARTS.*` to local CSVs in a fixed format (NTZ timestamps as
 # MAGIC `YYYY-MM-DD HH:MM:SS`, booleans as `true`/`false`, NULL as an empty
 # MAGIC field, exact decimals, round-trippable doubles), and those files are
@@ -62,7 +62,7 @@
 # COMMAND ----------
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, when, count, abs as spark_abs
+from pyspark.sql.functions import col, lit, when, count
 from pyspark.sql.types import (
     StructType,
     StructField,
@@ -363,18 +363,11 @@ def reconcile_fct_item_demand_by_hour(gold_df: DataFrame, snowflake_df: DataFram
 def reconcile_fct_price_ratio_by_tier(gold_df: DataFrame, snowflake_df: DataFrame) -> dict | None:
     """
     Key: loyalty_tier.
-    Exact compare: pre_units, post_units, pre_revenue, post_revenue.
-    Tolerance: units_ratio and revenue_ratio (DOUBLE) — absolute tolerance
-    1e-9: a ratio matches when abs(gold - snowflake) <= 1e-9.
-    Why absolute 1e-9: both ratios are O(1) (~0.88 to ~1.13 in Snowflake), so
-    an absolute bound is effectively a relative one here; 1e-9 is ~7 orders of
-    magnitude above double rounding error at that size, yet far below any
-    difference that would mean real logic drift (one unit out of ~1,300 moves
-    units_ratio by ~1e-3). Both engines do an IEEE-754 double division on
-    identical inputs, so an exact match is likely; the tolerance exists so a
-    last-bit difference in float conversion isn't reported as a logic bug.
-    The ratios are never NULL (pre/post inner join; pre_units > 0), but keep
-    the null-safe pattern for the exact columns anyway.
+    Exact compare: pre_units, post_units, units_ratio, pre_revenue,
+    post_revenue, revenue_ratio.
+    Tolerance: none. The two ratios are DOUBLE, but both engines divide the
+    same inputs and the export writes doubles in round-trip form, so they
+    match exactly; no tolerance is applied.
     Pass: gold_only = 0, snowflake_only = 0, value_mismatches = 0
     (expected 4 rows each side: guest, bronze, silver, gold — tier names,
     not medallion layers).

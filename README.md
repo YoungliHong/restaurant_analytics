@@ -19,12 +19,33 @@ flowchart LR
     D --> F["revenue marts<br/>(fct_revenue_*, fct_item_demand_*)"]
     E --> G["Streamlit Dashboard"]
     F --> G
-    D -.->|ported to PySpark| H["Databricks Free Edition<br/>(int_order_items_priced)"]
 
     style A fill:#e1f5ff,color:#000
     style B fill:#fff4e1,color:#000
-    style H fill:#f0e1ff,color:#000
     style G fill:#e1ffe1,color:#000
+```
+
+**Databricks medallion extension**
+
+```mermaid
+flowchart LR
+    A["generate_restaurant_data.py<br/>(same 5 CSVs)"] --> V[("Unity Catalog volume<br/>one folder per table")]
+    subgraph JOB["Databricks Job: restaurant_analytics_medallion"]
+        direction LR
+        B["bronze<br/>(append new files)"] --> S["silver<br/>(MERGE orders + line items,<br/>overwrite dims)"]
+        S --> G["gold<br/>(7 marts, overwrite)"]
+        G --> R{"reconcile<br/>(fails unless 7/7 match)"}
+    end
+    V --> B
+    M[("Snowflake<br/>ANALYTICS.MARTS")] --> X["scripts/export_marts.py"]
+    X -->|manual upload| E[("CSV exports<br/>(reconcile volume)")]
+    E --> R
+
+    style A fill:#e1f5ff,color:#000
+    style V fill:#fff4e1,color:#000
+    style M fill:#fff4e1,color:#000
+    style E fill:#fff4e1,color:#000
+    style JOB fill:#f0e1ff,color:#000
 ```
 
 **Stack flow**
@@ -34,7 +55,7 @@ flowchart LR
 
 3. Streamlit dashboard consumes the intermediates and marts.
 
-    **Parallel:** PySpark/Databricks reimplements the line-item pricing transform independently, reconciled against the dbt/SQL output.
+    **Parallel:** a Databricks medallion build (bronze → silver → gold) rebuilds the same seven marts from the same CSVs, loads new batches incrementally with Delta MERGE, and is reconciled against the Snowflake marts. See [Databricks Medallion Extension](#databricks-medallion-extension).
 
 ## Repository Structure
 
@@ -51,11 +72,22 @@ restaurant_analytics/
 ├── analyses/                         # ad-hoc queries, not part of the DAG
 │   └── signup_after_first_order_rate.sql
 ├── notebooks/
-│   └── int_order_items_priced.ipynb  # PySpark port, Databricks Free Edition
+│   ├── int_order_items_priced.ipynb  # original PySpark port (total-revenue check, writes no tables)
+│   └── databricks/                   # medallion extension, Databricks source format
+│       ├── 01_bronze.py              # append new files from the volume, skip loaded ones
+│       ├── 02_silver.py              # clean like dbt staging, dedup, MERGE
+│       ├── 03_gold.py                # rebuild the seven marts
+│       ├── 04_reconcile.py           # key-level diff vs Snowflake exports; fails unless 7/7
+│       ├── 05_merge_test.py          # batch-2 scenarios, rerun, restore + reconcile
+│       └── job.yml                   # Databricks Job: bronze → silver → gold → reconcile
+├── scripts/
+│   └── export_marts.py               # exports the seven Snowflake marts to CSV for reconcile
 ├── tests/                            # custom singular tests
 ├── sql/                              # raw stage + COPY INTO scripts (pre-dbt)
 ├── dashboard/
 │   └── app.py                        # Streamlit app
+├── docs/
+│   └── databricks.md                 # medallion flow, reconciliation, design decisions, known gaps
 ├── generate_restaurant_data.py       # synthetic source data generator
 ├── dbt_project.yml
 ├── packages.yml

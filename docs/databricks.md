@@ -113,7 +113,7 @@ The cost is a full read of bronze every run, which is trivial at this data size;
 dbt's `int_orders_deduped` keeps one row per order by `order_timestamp`, which was enough when there was only ever one batch. With several batches, the newer delivery of an order should win, so silver sorts by `_ingested_at` first, then dbt's `order_timestamp`, then the business columns.
 
 - **Batch-1 output can't change:** batch 1 is a single load, so every row shares one `_ingested_at` and dbt's rule decides, and batch 1's duplicates are byte-identical anyway.
-- **The final tiebreak exists for reruns, not correctness:** without it, two different rows tied on both timestamps could be picked in a different order on each run, so a rerun could flip which one wins and report an update. With it, the pick is the same every time. Whether it's the *right* pick is a known gap (see Known gaps).
+- **The final tiebreak exists for reruns, not correctness:** without it, two different rows tied on both timestamps could be picked in a different order on each run, so a rerun could flip which one wins and report an update. With it, the pick is the same every time. Whether it's the *right* pick is a known gap (see [Known gaps](#known-gaps)).
 
 ### Lineage columns are not part of change detection
 
@@ -126,3 +126,44 @@ As a result, a row's `_source_file` names the load that last *changed* it, not t
 Two behaviors the Delta documentation doesn't spell out, observed on Databricks Free Edition serverless, October 2026:
 - **A MERGE that changes nothing still writes a commit**, with 0 rows inserted, updated, and deleted. So a silver table's version moving is not evidence that anything changed. The merge test therefore reads the operation metrics of exactly the commits made since a recorded version, rather than the latest history entry. (Bronze is different: when no file is new it skips the write entirely, so its version really doesn't move.)
 - **Rows that match but fail the update condition aren't counted as updated.** In batch 2 the MERGE matched all 5,000 existing orders and reported 2 updated, the two real corrections. On the rerun it matched 5,003 and reported 0.
+
+## Known gaps
+
+### 1. Conflicting duplicates within one batch
+
+- **Gap:** two different rows for the same key in one load are resolved by the business-column tiebreak: deterministically, but not necessarily correctly.
+- **Risk:** silver could silently keep the stale version of a corrected order.
+- **Fix:** sort by a source `updated_at` or sequence number if the feed provides one. Without one, fail or quarantine conflicting keys instead of picking one.
+
+### 2. Deletes
+
+- **Gap:** the pipeline can't represent something being removed.
+- **Risk:** an order item could be voided, but the pipeline would never know. Silver and gold would keep counting its revenue, overstating the order's total.
+- **Fix:** three alternatives:
+  1. **Soft delete at the source:** removed items arrive with a `voided` status; silver keeps them and gold excludes them.
+  2. **Treat each new delivery of an order as the complete set of its items**, and delete any item that doesn't appear in the newest delivery, but only when that delivery includes line items for the order. Status-only corrections, like batch 2's orders 4845 and 4936, arrive without line items and must not wipe them out.
+  3. **CDC:** the source sends explicit insert, update, and delete operations.
+
+### 3. Gold on incremental silver
+
+- **Gap:** gold has never been built while batch 2 was in silver, only ever from batch-1 silver.
+- **Risk:** a gold bug that only shows up when statuses change or a new month arrives would go unnoticed, because reconcile has only ever compared batch-1 data.
+- **Fix:** build the equivalent final state (batch 1 with batch 2 applied) in dbt on Snowflake and use it as the expected outcome. Apply batch 2 to the raw CSVs by replacing the corrected rows rather than appending them: an appended correction has the same `order_timestamp` as the original, so dbt's `int_orders_deduped`, which sorts only by `order_timestamp`, would pick between them arbitrarily. Then, in `05_merge_test`, build gold before the restore and reconcile it against that.
+
+### 4. Batch-specific checks in silver section 8
+
+- **Gap:** the dimension-completeness and guest-count checks assume a single batch.
+- **Risk:** false failures once a second dimension snapshot or a guest/customer change arrives. The Job would go red on correct data.
+- **Fix:** compare against the latest-snapshot and latest-load-wins versions of bronze, not raw bronze. Fix this together with gap 5 (below).
+
+### 5. `latest_snapshot` is untested
+
+- **Gap:** `latest_snapshot()` has never run with more than one snapshot of a dimension table.
+- **Risk:** if it's wrong, silver dimensions could keep the old snapshot, or both. Customer changes (a new email, a loyalty-tier change) would then be lost, or customers duplicated, and `dim_customers` in gold would be wrong. One concrete edge case: two files for the same dimension landing in the same load share one `_ingested_at`, so the "newest" filter would keep both. Section 8's primary-key uniqueness check would catch the duplicates if the two files share customers (for example, two full snapshots); files covering different customers would pass it.
+- **Fix:** add a dimension fixture to `05_merge_test`: a second, complete customers snapshot with all 800 existing customers (one of them changed) plus one new customer. It has to be complete because `latest_snapshot` treats the newest file as the whole truth; a file with only the changed and new customers would leave silver with just those two. Assert that silver has the new count, the changed value, and the new load's `_ingested_at`. Silver dimensions don't carry `_source_file`, so asserting on the file itself would first need it added to the dimension cleaning functions. Fix gap 4's check at the same time: the same fixture is what would trigger its false failure, so the two fixes go together.
+
+### 6. The Job is a batch-1 regression check
+
+- **Gap:** reconcile compares against a fixed batch-1 export, so the Job is a regression check, not an ongoing quality gate.
+- **Risk:** the first real new batch fails the reconcile gate by design, so a red run can't tell a real bug from new data.
+- **Fix:** once gap 4 is fixed, gate ongoing runs on the invariant checks already in `02_silver` and `03_gold`, and run reconcile separately as a regression check. Until then, those checks would also fail on correct new data. Optionally, add an incremental-vs-full-rebuild comparison to test the MERGE path.

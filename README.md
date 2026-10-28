@@ -101,10 +101,10 @@ restaurant_analytics/
 
 ### Prerequisites
 
-- Python 3.10+ 
+- Python 3.9+
 - A Snowflake account with a warehouse, and a role with create/select privileges on two databases (`RAW_DATA`, `ANALYTICS`)
 - dbt Core (dbt-snowflake adapter)
-- Databricks account (Free Edition works) - only needed for PySpark layer
+- Databricks account (Free Edition works) - only needed for the Databricks medallion extension
 
 ### Setup
 
@@ -136,7 +136,7 @@ restaurant_analytics/
     python generate_restaurant_data.py
     ```
 
-6. Load raw CSVs into Snowflake (stage + COPY INTO  - see `sql/load_raw.sql`)
+6. Load raw CSVs into Snowflake (stage + COPY INTO  - see `sql/01_load_raw.sql`)
 
 7. Run dbt:
     ```bash
@@ -145,6 +145,17 @@ restaurant_analytics/
     ```
 
 8. Configure Streamlit's Snowflake connection in `.streamlit/secrets.toml` (see `sample.secrets.toml`)
+
+### Running the Databricks extension
+
+Run this after the dbt setup above, since reconcile compares against the dbt marts in Snowflake.
+
+1. **Load batch 1 into the volume.** Run the first cell of `01_bronze` to create the volume, then upload the five CSVs from `raw_data/` into one folder per table under `/Volumes/workspace/bronze/raw_files/` (for example `orders/orders.csv`).
+2. **Export the Snowflake marts.** Run `python scripts/export_marts.py`, which writes seven CSVs to `reconcile_exports/` (gitignored) using your dbt profile's key-pair credentials. Run the first cell of `04_reconcile` to create its volume, then upload the CSVs to `/Volumes/workspace/reconcile/snowflake_exports/`.
+3. **Run the pipeline:** either the Job, which was created in the Databricks UI with its definition exported to `notebooks/databricks/job.yml`, or `01_bronze` → `02_silver` → `03_gold` → `04_reconcile` by hand, which needs the repo added to the workspace as a Git folder. Reconcile fails unless all seven marts match.
+4. **Run the merge test (optional):** `05_merge_test` writes a small second batch, checks the inserts and updates, reruns it, then restores every table to batch 1 and reconciles again.
+
+`01_bronze` has a one-time `RESET` cell, off by default. It's only needed when moving from bronze tables built by the earlier overwrite version of the notebook; a fresh workspace doesn't need it.
 
 ## Data Model
 
@@ -313,7 +324,7 @@ Honest Caveats: This dedup logic assumes byte identical duplicates which won't a
 
 ### Signup-after-first-order handling
 
-The generator intentionally produces some customers with a signup_date after their first order — a plausible real-world pattern (a walk-in customer joining loyalty program after their first visit), not corrupted data. An early version of this check was a dbt test asserting `signup_date <= first_order_date`. In practice, `analyses/signup_after_first_order_rate.sql` shows this holds for ~21% of customers (166/800) - too high a rate to be noise, and not actually invalid. A test expected to fail on one in five rows isn't a meaningful test, so the check was moved to an analysis reporting the rate directly, and a boolean flag (`signup_after_first_order`) was added to `dim_customers` so the pattern is queryable rather than either silently ignored or treated as a pipeline failure.
+The generator intentionally produces some customers with a signup_date after their first order — a plausible real-world pattern (a walk-in customer joining loyalty program after their first visit), not corrupted data. An early version of this check was a dbt test asserting `signup_date <= first_order_date`. In practice, `analyses/signup_after_first_order_rate.sql` shows this holds for ~21% of customers (166/800) - too high a rate to be noise, and not actually invalid. A test expected to fail on one in five rows isn't a meaningful test, so the check was moved to an analysis reporting the rate directly, and a boolean flag (`is_signup_after_first_order`) was added to `dim_customers` so the pattern is queryable rather than either silently ignored or treated as a pipeline failure.
 
 ### Naming convention: model name (layer) vs. alias (materialization)
 
@@ -403,7 +414,13 @@ The Databricks pipeline has its own tests (batch-1 regression, incremental merge
 ## Future Work
 - **Phase 7 (real POS data)** - swapping in a real extract from family restaurant's POS system, mapped onto the existing staging layer. Deliberately scoped tight: one or two genuine insights, not a second project.
 
-- **Incremental materialization** - the current models fully refresh on every run, which is fine at this data volume. Would reach for `incremental` materializations at a scale where reprocessing full history becomes the actual bottleneck.
+- **Incremental materialization in dbt** - the dbt models fully refresh on every run, which is fine at this data volume. Would reach for `incremental` materializations at a scale where reprocessing full history becomes the actual bottleneck. (The Databricks extension already loads incrementally with MERGE.)
+
+- **Full-refresh equivalence** - verify gold built on incremental silver: apply batch 2 to the raw data, rebuild the marts in dbt on Snowflake, and reconcile post-batch-2 gold against them (known gap 3 in [docs/databricks.md](docs/databricks.md#known-gaps)).
+
+- **Scheduled trigger** - the Job runs manually. A schedule makes sense once ongoing runs are gated on invariant checks rather than the fixed batch-1 reconcile (known gap 6).
+
+- **Auto Loader / Change Data Feed** - Auto Loader to discover new files in place of bronze's path anti-join at larger scale; Change Data Feed so downstream layers read only the rows that changed instead of whole tables.
 
 - **Real-time/streaming-ingestion** - the current pipeline is batch, matching how POS data is actually available (periodic exports, not a live event feed). Streaming would only be warranted if a future requirement needed sub-minute latency on live order data. 
 

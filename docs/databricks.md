@@ -2,6 +2,14 @@
 
 Companion to the [Databricks Medallion Extension](../README.md#databricks-medallion-extension) section of the README. Code is in [`notebooks/databricks/`](../notebooks/databricks/).
 
+## Contents
+- [Background](#background)
+- [How a batch flows](#how-a-batch-flows)
+- [Reconciliation](#reconciliation)
+- [The Job](#the-job)
+- [Design decisions](#design-decisions)
+- [Known gaps](#known-gaps)
+  
 ## Background
 
 This started as a single-transform check. `int_order_items_priced` was ported to PySpark ([`notebooks/int_order_items_priced.ipynb`](../notebooks/int_order_items_priced.ipynb)) and run on Databricks Free Edition, to get hands-on time with Spark outside Cosmos (Microsoft's internal data lake, queried with SCOPE). That notebook read the source CSV, computed line-item revenue in memory, and matched the dbt/Snowflake total revenue to the cent ($180,604.30). It wrote no tables and compared a total, not rows.

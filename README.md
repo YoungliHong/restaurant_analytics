@@ -1,5 +1,16 @@
 # Restaurant Analytics Pipeline
-
+## Contents
+- [Architecture](#architecture)
+- [Repository Structure](#repository-structure)
+- [Getting Started](#getting-started)
+- [Data Model](#data-model)
+- [Lineage Graph](#lineage-graph)
+- [Design Decisions](#design-decisions)
+- [Dashboard](#dashboard)
+- [Databricks Medallion Extension](#databricks-medallion-extension)
+- [Testing](#testing)
+- [Future Work](#future-work)
+  
 ## Overview
 
 A dbt + Snowflake pipeline built on synthetic restaurant POS data, modeling transaction-time pricing, deduplication, and staging cleanup.
